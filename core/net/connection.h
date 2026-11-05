@@ -25,12 +25,19 @@ struct DecodedFrame {
 // 一条帧化 TCP 连接：负责组装头部、分配 msg_id、串行化发送。
 class Connection {
  public:
-  explicit Connection(TcpSocket socket) : socket_(std::move(socket)) {}
+  explicit Connection(TcpSocket socket) : socket_(std::move(socket)) {
+    // 发送超时兜底：对端长期不读时，send 不能永久阻塞（否则 send_mutex_ 会连带
+    // 卡死所有控制消息，连关闭会话都发不出去）。
+    socket_.set_send_timeout_ms(10000);
+  }
 
   bool alive() const { return socket_.valid(); }
   void close() { socket_.close(); }
   void set_recv_timeout_ms(int milliseconds) {
     socket_.set_recv_timeout_ms(milliseconds);
+  }
+  void set_send_timeout_ms(int milliseconds) {
+    socket_.set_send_timeout_ms(milliseconds);
   }
 
   bool send(MsgType type, uint64_t session_id, const uint8_t* payload,

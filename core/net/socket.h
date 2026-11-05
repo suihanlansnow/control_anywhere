@@ -35,6 +35,8 @@ class TcpSocket {
   bool send_all(const void* data, std::size_t length);
   bool recv_exact(void* data, std::size_t length);
   void set_recv_timeout_ms(int milliseconds);
+  // 发送超时：对端长期不读时，send 不能无限阻塞（会连带卡住持锁的调用方）。
+  void set_send_timeout_ms(int milliseconds);
 
   static TcpSocket connect(const std::string& host, uint16_t port, std::string* error);
 

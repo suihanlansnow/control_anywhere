@@ -92,6 +92,18 @@ void TcpSocket::set_recv_timeout_ms(int milliseconds) {
                reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 }
 
+void TcpSocket::set_send_timeout_ms(int milliseconds) {
+#ifdef _WIN32
+  DWORD timeout = static_cast<DWORD>(milliseconds);
+#else
+  timeval timeout{};
+  timeout.tv_sec = milliseconds / 1000;
+  timeout.tv_usec = (milliseconds % 1000) * 1000;
+#endif
+  ::setsockopt(to_native(fd_), SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+}
+
 TcpSocket TcpSocket::connect(const std::string& host, uint16_t port,
                              std::string* error) {
   net_init();
