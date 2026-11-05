@@ -232,29 +232,21 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
     CapturedFrame frame;
     {
       std::unique_lock<std::mutex> lock(slot.mutex);
-      // 等到发帧时点；等待期间只要来了新画面就立刻替换。
-      for (;;) {
-        auto now_point = std::chrono::steady_clock::now();
-        if (now_point >= next_slot) break;
-        auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(next_slot - now_point);
-        if (remain > std::chrono::milliseconds(4)) remain = std::chrono::milliseconds(4);
-        slot.cv.wait_for(lock, remain, [&slot] { return slot.has_frame || slot.stop; });
-        if (slot.stop) { stop_flag_.store(true); break; }
-        if (slot.has_frame) {
-          frame = std::move(slot.frame);
-          slot.has_frame = false;
-          continue;  // 继续等到节拍
-        }
-        // 画面静止时没新帧，直接跳到节拍点
-        break;
+      // 等到节拍点，期间有新帧就提前取走（队列深度 1，后来的覆盖先来的）。
+      slot.cv.wait_until(lock, next_slot, [&slot] { return slot.has_frame || slot.stop; });
+      if (slot.stop) { stop_flag_.store(true); break; }
+      if (slot.has_frame) {
+        frame = std::move(slot.frame);
+        slot.has_frame = false;
       }
-      if (slot.stop) break;
-      if (frame.pixels.empty() && !frame.gpu_texture) continue;
     }
     next_slot += frame_interval;
     if (next_slot < std::chrono::steady_clock::now()) {
       next_slot = std::chrono::steady_clock::now();
     }
+
+    // 画面静止时这一拍没有新帧：节拍已推进，跳过编码不会空转。
+    if (frame.pixels.empty() && !frame.gpu_texture) continue;
 
     EncodedFrame encoded;
     std::string enc_error;

@@ -16,6 +16,10 @@ bool allowed(SessionState from, SessionState to) {
       return to == SessionState::Connecting || to == SessionState::Invited ||
              to == SessionState::Closing || to == SessionState::Closed;
     case SessionState::Connecting:
+      // 主控端收到 ConnectRsp（中继确认被控端在线）即进入 Ready，
+      // 之后才等 AuthChallenge；被控端一侧则走 Invited -> Authing。
+      return to == SessionState::Ready || to == SessionState::Authing ||
+             to == SessionState::Closing || to == SessionState::Closed;
     case SessionState::Invited:
       return to == SessionState::Authing || to == SessionState::Closing ||
              to == SessionState::Closed;
@@ -23,8 +27,9 @@ bool allowed(SessionState from, SessionState to) {
       return to == SessionState::Ready || to == SessionState::Closing ||
              to == SessionState::Closed;
     case SessionState::Ready:
-      return to == SessionState::Streaming || to == SessionState::Closing ||
-             to == SessionState::Closed;
+      // 主控端收到 ConnectRsp 后处于 Ready，再收到 AuthChallenge 转入 Authing。
+      return to == SessionState::Authing || to == SessionState::Streaming ||
+             to == SessionState::Closing || to == SessionState::Closed;
     case SessionState::Streaming:
       return to == SessionState::Closing || to == SessionState::Closed;
     case SessionState::Closing:
@@ -57,6 +62,8 @@ bool can_transition(SessionState from, SessionState to) {
 }
 
 bool SessionGuard::move_to(SessionState next, const char* tag) {
+  // 同一状态重复设置是幂等的：主控端收到 ConnectRsp 与 AuthResult 时都会置 Ready。
+  if (next == state_) return true;
   if (!allowed(state_, next)) {
     RC_LOGW(tag, "illegal state transition " << state_name(state_) << " -> "
                                              << state_name(next));

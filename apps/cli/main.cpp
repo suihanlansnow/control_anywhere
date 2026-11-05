@@ -610,6 +610,8 @@ void install_callbacks(rc::HostRunner& runner) {
   runner.set_log_callback([](const std::string& tag, const std::string& level,
                               const std::string& msg) {
     std::printf("[%s] %s %s\n", level.c_str(), tag.c_str(), msg.c_str());
+    // 重定向到文件时 stdout 是块缓冲，不刷新就看不到运行中的日志。
+    std::fflush(stdout);
   });
   runner.set_status_callback([](const std::string& state) {
     std::printf("status: %s\n", state.c_str());
@@ -626,6 +628,8 @@ void install_callbacks(rc::ClientRunner& runner) {
   runner.set_log_callback([](const std::string& tag, const std::string& level,
                               const std::string& msg) {
     std::printf("[%s] %s %s\n", level.c_str(), tag.c_str(), msg.c_str());
+    // 重定向到文件时 stdout 是块缓冲，不刷新就看不到运行中的日志。
+    std::fflush(stdout);
   });
   runner.set_status_callback([](const std::string& state) {
     std::printf("status: %s\n", state.c_str());
