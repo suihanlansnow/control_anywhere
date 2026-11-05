@@ -601,6 +601,8 @@ rc::SessionConfig to_session_config(const Options& opts) {
   cfg.quality = opts.quality;
   cfg.monitor = opts.monitor;
   cfg.max_frames = opts.frames;
+  // 之前漏了映射，--no-render 被静默忽略，连接时总会开一个渲染窗口。
+  cfg.render = opts.render;
   return cfg;
 }
 
