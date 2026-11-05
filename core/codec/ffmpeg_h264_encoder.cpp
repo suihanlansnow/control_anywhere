@@ -1,8 +1,10 @@
 #include "codec/ffmpeg_h264_encoder.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "base/clock.h"
+#include "base/log.h"
 
 namespace rc {
 
@@ -16,6 +18,29 @@ static const HwCodecProfile kHwProfiles[] = {
     {"h264_qsv",   AV_PIX_FMT_NV12},
     {nullptr, AV_PIX_FMT_NONE}};
 
+namespace {
+
+// 硬件编码器优先级由用户运行时指定：环境变量 RC_H264_ENCODER=auto|nvenc|qsv|soft。
+// auto 保持 nvenc > qsv > libx264 的原顺序；显式指定时只尝试该后端，
+// 打不开就回退软编，同时把实际选用结果打到日志，便于现场确认。
+enum class EncoderPreference { kAuto, kNvenc, kQsv, kSoft };
+
+EncoderPreference read_encoder_preference() {
+  const char* value = std::getenv("RC_H264_ENCODER");
+  if (value == nullptr || *value == '\0' || std::strcmp(value, "auto") == 0) {
+    return EncoderPreference::kAuto;
+  }
+  if (std::strcmp(value, "nvenc") == 0) return EncoderPreference::kNvenc;
+  if (std::strcmp(value, "qsv") == 0) return EncoderPreference::kQsv;
+  if (std::strcmp(value, "soft") == 0 || std::strcmp(value, "libx264") == 0) {
+    return EncoderPreference::kSoft;
+  }
+  RC_LOGW("codec", "unknown RC_H264_ENCODER=" << value << ", falling back to auto");
+  return EncoderPreference::kAuto;
+}
+
+}  // namespace
+
 FFmpegH264Encoder::FFmpegH264Encoder() = default;
 
 FFmpegH264Encoder::~FFmpegH264Encoder() { close(); }
@@ -28,7 +53,13 @@ bool FFmpegH264Encoder::open(int width, int height, int fps, int quality,
   fps_ = fps > 0 ? fps : 30;
   quality_ = quality > 0 ? quality : 23;
 
-  for (const HwCodecProfile* p = kHwProfiles; p->name; ++p) {
+  const EncoderPreference preference = read_encoder_preference();
+
+  for (const HwCodecProfile* p = kHwProfiles;
+       p->name != nullptr && preference != EncoderPreference::kSoft; ++p) {
+    if (preference == EncoderPreference::kNvenc && std::strcmp(p->name, "h264_nvenc") != 0) continue;
+    if (preference == EncoderPreference::kQsv && std::strcmp(p->name, "h264_qsv") != 0) continue;
+
     codec_ = avcodec_find_encoder_by_name(p->name);
     if (!codec_) continue;
 
@@ -55,8 +86,10 @@ bool FFmpegH264Encoder::open(int width, int height, int fps, int quality,
       av_dict_free(&opts);
       is_hw_ = true;
       rc_pix_fmt_ = p->pix_fmt;
+      RC_LOGI("codec", "ffmpeg h264 encoder=" << p->name << " (hardware)");
       return finish_open();
     }
+    RC_LOGW("codec", "hw encoder " << p->name << " open failed, trying next");
     av_dict_free(&opts);
     avcodec_free_context(&ctx_);
     ctx_ = nullptr;
@@ -99,6 +132,7 @@ bool FFmpegH264Encoder::open(int width, int height, int fps, int quality,
   }
   av_dict_free(&opts);
   rc_pix_fmt_ = AV_PIX_FMT_YUV420P;
+  RC_LOGI("codec", "ffmpeg h264 encoder=" << codec_->name << " (software)");
 
   return finish_open();
 }
