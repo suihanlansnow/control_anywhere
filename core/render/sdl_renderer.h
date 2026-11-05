@@ -34,6 +34,10 @@ class SdlRenderer : public IRenderer {
   bool alive_ = false;
   int width_ = 0;
   int height_ = 0;
+  // 上屏节流：PRESENTVSYNC 下每帧都 RenderPresent 会阻塞解码循环，
+  // 按显示器刷新率丢帧，只上屏“最新一帧”。
+  int refresh_hz_ = 60;
+  uint64_t last_present_us_ = 0;
 };
 
 }  // namespace rc

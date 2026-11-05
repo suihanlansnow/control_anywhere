@@ -1,5 +1,6 @@
 #include "render/sdl_renderer.h"
 
+#include "base/clock.h"
 #include "base/log.h"
 
 namespace rc {
@@ -48,10 +49,20 @@ bool SdlRenderer::open(const std::string& title, int width, int height,
     return false;
   }
 
+  // 取显示器刷新率作为上屏节拍；拿不到就按 60Hz 估计。
+  const int display_index = SDL_GetWindowDisplayIndex(window_);
+  if (display_index >= 0) {
+    SDL_DisplayMode mode;
+    if (SDL_GetCurrentDisplayMode(display_index, &mode) == 0 && mode.refresh_rate > 0) {
+      refresh_hz_ = mode.refresh_rate;
+    }
+  }
+
   width_ = width;
   height_ = height;
+  last_present_us_ = 0;
   alive_ = true;
-  RC_LOGI("sdl", "renderer opened " << width << "x" << height);
+  RC_LOGI("sdl", "renderer opened " << width << "x" << height << " @" << refresh_hz_ << "Hz");
   return true;
 }
 
@@ -75,6 +86,12 @@ void SdlRenderer::pump() {
 void SdlRenderer::present(const uint8_t* bgra, int width, int height, int stride) {
   if (!alive_ || !texture_) return;
 
+  // 距上次上屏不足一个刷新周期就直接丢弃这一帧：PRESENTVSYNC 会阻塞到下次垂直同步，
+  // 若每帧都 present，解码循环会被拖慢到显示器刷新率以下。
+  const uint64_t now = now_us();
+  const uint64_t period_us = 1000000ULL / static_cast<uint64_t>(refresh_hz_ > 0 ? refresh_hz_ : 60);
+  if (last_present_us_ != 0 && now - last_present_us_ < period_us) return;
+
   if (SDL_UpdateTexture(texture_, nullptr, bgra, stride) != 0) {
     RC_LOGW("sdl", "SDL_UpdateTexture failed: " << SDL_GetError());
     return;
@@ -83,6 +100,7 @@ void SdlRenderer::present(const uint8_t* bgra, int width, int height, int stride
   SDL_RenderClear(renderer_);
   SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
   SDL_RenderPresent(renderer_);
+  last_present_us_ = now;
 }
 
 }  // namespace rc
