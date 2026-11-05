@@ -386,9 +386,11 @@ int HostRunner::run() {
 
         if (!ok) {
           log_("WARN", "host", "authentication failed");
-          guard.move_to(SessionState::Closing);
-          if (status_cb_) status_cb_("auth_failed");
-          return 3;
+          guard.move_to(SessionState::Registered);
+          session_id = 0;
+          nonce.clear();
+          if (status_cb_) status_cb_("registered");
+          break;
         }
         guard.move_to(SessionState::Ready);
         guard.move_to(SessionState::Streaming);
@@ -400,10 +402,12 @@ int HostRunner::run() {
         json::Value ack = make_object();
         ack.set("reason", "ack");
         conn.send_json(MsgType::SessionClose, session_id, ack);
-        guard.move_to(SessionState::Closed);
-        log_("INFO", "host", "session closed by controller");
-        if (status_cb_) status_cb_("closed");
-        return 0;
+        guard.move_to(SessionState::Registered);
+        session_id = 0;
+        nonce.clear();
+        log_("INFO", "host", "session closed, waiting for next controller");
+        if (status_cb_) status_cb_("registered");
+        break;
       }
       default:
         break;
