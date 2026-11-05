@@ -13,6 +13,28 @@
 
 namespace rc {
 
+namespace {
+
+// 统一的 XShm 资源释放：detach → 解绑 data 指针 → 销毁 XImage → shmdt → shmctl(IPC_RMID) → delete。
+// 所有 start() 失败回退、grab() 运行时回退、stop() 正路清理都走这一条，避免泄漏。
+static void cleanup_xshm(Display* display, XShmSegmentInfo*& info, XImage*& img,
+                         unsigned char*& shm_data) {
+  if (!info) return;
+  if (display) XShmDetach(display, info);
+  if (img) {
+    img->data = nullptr;  // 阻止 XDestroyImage 去 free 共享内存
+    XDestroyImage(img);
+    img = nullptr;
+  }
+  shm_data = nullptr;
+  if (info->shmaddr) shmdt(info->shmaddr);
+  if (info->shmid != -1) shmctl(info->shmid, IPC_RMID, nullptr);
+  delete info;
+  info = nullptr;
+}
+
+}  // namespace
+
 X11Capture::X11Capture() = default;
 
 X11Capture::~X11Capture() { stop(); }
@@ -42,48 +64,35 @@ bool X11Capture::start(int monitor_index, std::string* error) {
   Visual* visual = XDefaultVisual(display_, screen_);
 
   if (XShmQueryExtension(display_)) {
-    XShmSegmentInfo* shm_info = new XShmSegmentInfo{};
-    shm_info_ = shm_info;
+    shm_info_ = new XShmSegmentInfo{};
 
     shm_img_ = XShmCreateImage(display_, visual, depth, ZPixmap,
-                                nullptr, shm_info, width_, height_);
+                                nullptr, shm_info_, width_, height_);
     if (!shm_img_) {
       RC_LOGW("x11", "XShmCreateImage failed, falling back to XGetImage");
-      delete shm_info;
-      shm_info_ = nullptr;
+      cleanup_xshm(display_, static_cast<XShmSegmentInfo*&>(shm_info_), shm_img_, shm_data_);
     } else {
       size_t img_size = static_cast<size_t>(shm_img_->bytes_per_line) * shm_img_->height;
       int shmid = shmget(IPC_PRIVATE, img_size, IPC_CREAT | 0600);
       if (shmid == -1) {
         RC_LOGW("x11", "shmget failed, falling back to XGetImage");
-        delete shm_info;
-        shm_info_ = nullptr;
-        XDestroyImage(shm_img_);
-        shm_img_ = nullptr;
+        cleanup_xshm(display_, static_cast<XShmSegmentInfo*&>(shm_info_), shm_img_, shm_data_);
       } else {
         char* addr = static_cast<char*>(shmat(shmid, nullptr, 0));
         if (addr == reinterpret_cast<char*>(-1)) {
           RC_LOGW("x11", "shmat failed, falling back to XGetImage");
-          shmctl(shmid, IPC_RMID, nullptr);
-          delete shm_info;
-          shm_info_ = nullptr;
-          XDestroyImage(shm_img_);
-          shm_img_ = nullptr;
+          cleanup_xshm(display_, static_cast<XShmSegmentInfo*&>(shm_info_), shm_img_, shm_data_);
         } else {
-          shm_info->shmid = shmid;
-          shm_info->shmaddr = addr;
+          auto* info = static_cast<XShmSegmentInfo*>(shm_info_);
+          info->shmid = shmid;
+          info->shmaddr = addr;
           shm_img_->data = addr;
 
-          if (!XShmAttach(display_, shm_info)) {
+          if (!XShmAttach(display_, info)) {
             RC_LOGW("x11", "XShmAttach failed, falling back to XGetImage");
-            shmdt(addr);
-            shmctl(shmid, IPC_RMID, nullptr);
-            delete shm_info;
-            shm_info_ = nullptr;
-            XDestroyImage(shm_img_);
-            shm_img_ = nullptr;
+            cleanup_xshm(display_, info, shm_img_, shm_data_);
           } else {
-            shm_info->readOnly = true;
+            info->readOnly = true;
             shm_data_ = reinterpret_cast<unsigned char*>(addr);
             use_xshm_ = true;
             RC_LOGI("x11", "using XShm shared memory capture");
@@ -113,19 +122,10 @@ void X11Capture::stop() {
   if (!started_) return;
   started_ = false;
 
-  if (use_xshm_ && shm_info_) {
+  if (shm_info_) {
     auto* info = static_cast<XShmSegmentInfo*>(shm_info_);
-    XShmDetach(display_, info);
-    if (shm_img_) {
-      shm_img_->data = nullptr;
-      XDestroyImage(shm_img_);
-      shm_img_ = nullptr;
-    }
-    shmdt(info->shmaddr);
-    shmctl(info->shmid, IPC_RMID, nullptr);
-    delete info;
+    cleanup_xshm(display_, info, shm_img_, shm_data_);
     shm_info_ = nullptr;
-    shm_data_ = nullptr;
     use_xshm_ = false;
   }
 
@@ -199,7 +199,12 @@ bool X11Capture::grab(CapturedFrame& frame, int timeout_ms) {
 
   if (use_xshm_ && shm_img_) {
     if (!XShmGetImage(display_, root_, shm_img_, 0, 0, AllPlanes)) {
+      // 运行时共享内存失效（X server 重启、segment 被外部清理等）——
+      // 必须在回退到 XGetImage 前把自己持有的 segment 彻底释放，否则进程结束前一直泄漏。
       RC_LOGW("x11", "XShmGetImage failed, falling back to XGetImage");
+      auto* info = static_cast<XShmSegmentInfo*>(shm_info_);
+      cleanup_xshm(display_, info, shm_img_, shm_data_);
+      shm_info_ = nullptr;
       use_xshm_ = false;
     } else {
       img = shm_img_;
