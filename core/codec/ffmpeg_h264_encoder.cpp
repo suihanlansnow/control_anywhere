@@ -209,7 +209,13 @@ bool FFmpegH264Encoder::encode(const CapturedFrame& source, EncodedFrame& out,
             frame_->data, frame_->linesize);
 
   frame_->pts = pts_++;
+  // 时间戳队列只为把输出的包映射回采集时刻；编码器长时间不出包时不能无限增长，
+  // 只保留最近若干帧即可（更老的映射已无意义）。
+  constexpr std::size_t kMaxPendingTimestamps = 16;
   pending_capture_ts_.push_back(static_cast<uint64_t>(source.capture_ts_us));
+  while (pending_capture_ts_.size() > kMaxPendingTimestamps) {
+    pending_capture_ts_.pop_front();
+  }
 
   int ret = avcodec_send_frame(ctx_, frame_);
   if (ret < 0) {
@@ -235,8 +241,14 @@ bool FFmpegH264Encoder::encode(const CapturedFrame& source, EncodedFrame& out,
     out.keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
     out.width = source.width;
     out.height = source.height;
-    out.capture_ts_us = pending_capture_ts_.front();
-    pending_capture_ts_.pop_front();
+    // 一个输入帧可能产出多个包（B 帧/异步编码），队列空了就退回当前时间，
+    // 避免对空 deque 取 front/pop_front 造成未定义行为。
+    if (!pending_capture_ts_.empty()) {
+      out.capture_ts_us = pending_capture_ts_.front();
+      pending_capture_ts_.pop_front();
+    } else {
+      out.capture_ts_us = static_cast<uint64_t>(now_us());
+    }
     out.encode_ts_us = static_cast<uint64_t>(now_us());
     out.data.assign(pkt_->data, pkt_->data + pkt_->size);
   }
