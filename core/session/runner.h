@@ -48,6 +48,7 @@ class ClientRunner {
   void set_log_callback(LogCallback cb) { log_cb_ = std::move(cb); }
   void set_status_callback(StatusCallback cb) { status_cb_ = std::move(cb); }
   void set_progress_callback(ProgressCallback cb) { progress_cb_ = std::move(cb); }
+  void set_frame_callback(FrameCallback cb) { frame_cb_ = std::move(cb); }
 
   int run();
   void stop();
@@ -60,6 +61,7 @@ class ClientRunner {
   LogCallback log_cb_;
   StatusCallback status_cb_;
   ProgressCallback progress_cb_;
+  FrameCallback frame_cb_;
 };
 
 }  // namespace rc

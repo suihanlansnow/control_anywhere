@@ -9,6 +9,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QPixmap>
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QSlider>
@@ -32,6 +33,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   connect(worker_, &BackendWorker::logMessage, this, &MainWindow::onLogMsg);
   connect(worker_, &BackendWorker::statusChanged, this, &MainWindow::onStatusChanged);
   connect(worker_, &BackendWorker::progressUpdated, this, &MainWindow::onProgressUpdated);
+  connect(worker_, &BackendWorker::frameReady, this, &MainWindow::onFrameReady);
   connect(worker_, &BackendWorker::finished, this, &MainWindow::onWorkerFinished);
 
   workerThread_->start();
@@ -291,6 +293,20 @@ QWidget* MainWindow::buildDisplayPanel() {
   hl->addWidget(title);
   hl->addWidget(desc);
   scroll->addWidget(header);
+
+  auto* cardVideo = makeCard(tr("远程画面"));
+  cardVideo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+  {
+    auto* vbox = static_cast<QVBoxLayout*>(cardVideo->layout());
+    videoView_ = new QLabel(tr("等待远程画面…"));
+    videoView_->setAlignment(Qt::AlignCenter);
+    videoView_->setMinimumHeight(320);
+    videoView_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    videoView_->setStyleSheet(
+        "background-color:#101014; color:#8a8f98; border-radius:6px;");
+    vbox->addWidget(videoView_, 1);
+  }
+  scroll->addWidget(cardVideo, 1);
 
   auto* card1 = makeCard(tr("画面质量"));
   {
@@ -817,6 +833,14 @@ void MainWindow::onProgressUpdated(int frames, qlonglong bytes) {
   if (logView_) {
     logView_->append(QString("progress: frames=%1 bytes=%2").arg(frames).arg(bytes));
   }
+}
+
+void MainWindow::onFrameReady(QImage image) {
+  if (!videoView_ || image.isNull()) return;
+  // 按控件大小等比缩放；每帧平滑缩放太贵，用快速变换。
+  const QPixmap pix = QPixmap::fromImage(image).scaled(
+      videoView_->size(), Qt::KeepAspectRatio, Qt::FastTransformation);
+  videoView_->setPixmap(pix);
 }
 
 void MainWindow::onWorkerFinished(int rc) {

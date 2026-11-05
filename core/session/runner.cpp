@@ -562,6 +562,10 @@ int ClientRunner::run() {
           if (data && decoder->decode(data, data_len, meta.capture_ts_us, picture, &dec_error)) {
             total_decode_us += now_us() - t0;
             ++frames_decoded;
+            // 交给上层显示（GUI 会在这里做一次深拷贝再跨线程投递）。
+            if (frame_cb_ && !picture.pixels.empty() && !picture.nv12 && picture.stride > 0) {
+              frame_cb_(picture.pixels.data(), picture.width, picture.height, picture.stride);
+            }
           }
         }
 

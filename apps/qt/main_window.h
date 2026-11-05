@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QImage>
 #include <QMainWindow>
 #include <QThread>
 
@@ -32,6 +33,7 @@ class MainWindow : public QMainWindow {
   void onLogMsg(const QString& tag, const QString& level, const QString& msg);
   void onStatusChanged(const QString& state);
   void onProgressUpdated(int frames, qlonglong bytes);
+  void onFrameReady(QImage image);
   void onWorkerFinished(int rc);
 
  private:
@@ -48,6 +50,8 @@ class MainWindow : public QMainWindow {
   QStackedWidget* panels_ = nullptr;
   QLabel* statusText_ = nullptr;
   QTextEdit* logView_ = nullptr;
+  // 远程画面显示区（解码后的 BGRA 缩放上屏）。
+  QLabel* videoView_ = nullptr;
 
   QLineEdit* editPassword_ = nullptr;
   QCheckBox* switchForcePwd_ = nullptr;

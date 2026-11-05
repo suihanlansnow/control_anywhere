@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QImage>
 #include <QObject>
 #include <memory>
 
@@ -22,6 +23,8 @@ class BackendWorker : public QObject {
   void logMessage(const QString& tag, const QString& level, const QString& msg);
   void statusChanged(const QString& state);
   void progressUpdated(int frames, qlonglong bytes);
+  // 主控端解码后的画面（BGRA），由后台线程发出，Qt 自动排队到 UI 线程。
+  void frameReady(QImage image);
   void finished(int exitCode);
 
  private:
