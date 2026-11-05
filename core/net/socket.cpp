@@ -19,6 +19,7 @@ using native_socket = SOCKET;
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 using native_socket = int;
 #define RC_CLOSE_SOCKET ::close
@@ -63,6 +64,68 @@ bool TcpSocket::send_all(const void* data, std::size_t length) {
     if (sent <= 0) return false;
     cursor += sent;
     remaining -= static_cast<std::size_t>(sent);
+  }
+  return true;
+}
+
+bool TcpSocket::send_vectored(const uint8_t* const* buffers, const std::size_t* sizes,
+                              int count) {
+  constexpr int kMaxVectors = 3;
+  if (count <= 0 || count > kMaxVectors) return false;
+
+  int first = 0;        // 当前待发段
+  std::size_t skip = 0;  // 当前段内已发出的字节数
+
+  while (first < count) {
+#ifdef _WIN32
+    WSABUF bufs[kMaxVectors];
+    int nbufs = 0;
+    for (int i = first; i < count; ++i) {
+      const std::size_t begin = (i == first) ? skip : 0;
+      if (sizes[i] <= begin) continue;
+      bufs[nbufs].buf = reinterpret_cast<char*>(const_cast<uint8_t*>(buffers[i])) + begin;
+      bufs[nbufs].len = static_cast<ULONG>(sizes[i] - begin);
+      ++nbufs;
+    }
+    if (nbufs == 0) return true;
+    DWORD sent = 0;
+    if (::WSASend(to_native(fd_), bufs, static_cast<DWORD>(nbufs), &sent, 0, nullptr,
+                  nullptr) != 0) {
+      return false;
+    }
+    std::size_t written = static_cast<std::size_t>(sent);
+#else
+    struct iovec iov[kMaxVectors];
+    int nbufs = 0;
+    for (int i = first; i < count; ++i) {
+      const std::size_t begin = (i == first) ? skip : 0;
+      if (sizes[i] <= begin) continue;
+      iov[nbufs].iov_base = const_cast<uint8_t*>(buffers[i]) + begin;
+      iov[nbufs].iov_len = sizes[i] - begin;
+      ++nbufs;
+    }
+    if (nbufs == 0) return true;
+    struct msghdr msg {};
+    msg.msg_iov = iov;
+    msg.msg_iovlen = nbufs;
+    const ssize_t sent = ::sendmsg(to_native(fd_), &msg, 0);
+    if (sent <= 0) return false;
+    std::size_t written = static_cast<std::size_t>(sent);
+#endif
+    if (written == 0) return false;
+
+    // 按实际写入量推进段游标（处理部分写，通常是发送缓冲满）。
+    while (written > 0 && first < count) {
+      const std::size_t available = sizes[first] - skip;
+      if (written >= available) {
+        written -= available;
+        ++first;
+        skip = 0;
+      } else {
+        skip += written;
+        written = 0;
+      }
+    }
   }
   return true;
 }

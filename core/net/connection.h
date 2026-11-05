@@ -46,7 +46,7 @@ class Connection {
   bool send_json(MsgType type, uint64_t session_id, const json::Value& value,
                  uint32_t seq = 0, uint8_t flags = 0);
 
-  // 视频帧专用：在复用缓冲里直接写帧头 + 视频头 + 码流，一次发送，零中间分配。
+  // 视频帧专用：帧头 + 视频头 + 码流三段分散写，一次发送，零中间拷贝。
   bool send_video_frame(uint64_t session_id, const VideoFrameMeta& meta,
                         const uint8_t* data, std::size_t length, uint32_t seq);
 
@@ -55,14 +55,13 @@ class Connection {
   uint32_t next_msg_id() { return msg_id_.fetch_add(1); }
 
  private:
-  // 把帧头写进 send_buf_ 前 24 字节；返回指向 payload 区的指针。
-  uint8_t* write_frame_header(MsgType type, uint64_t session_id, uint32_t seq,
-                              uint8_t flags, std::size_t payload_len);
+  // 把 24 字节帧头写进调用方提供的缓冲（栈上），不再占用整帧大小的复用缓冲。
+  bool build_frame_header(uint8_t* out, MsgType type, uint64_t session_id,
+                          uint32_t seq, uint8_t flags, std::size_t payload_len);
 
   std::mutex send_mutex_;
   TcpSocket socket_;
   std::atomic<uint32_t> msg_id_{1};
-  std::vector<uint8_t> send_buf_;  // 复用的发送缓冲，避免每帧堆分配
 };
 
 }  // namespace rc

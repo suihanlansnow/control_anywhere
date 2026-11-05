@@ -6,15 +6,13 @@
 
 namespace rc {
 
-uint8_t* Connection::write_frame_header(MsgType type, uint64_t session_id,
-                                        uint32_t seq, uint8_t flags,
-                                        std::size_t payload_len) {
+bool Connection::build_frame_header(uint8_t* out, MsgType type, uint64_t session_id,
+                                    uint32_t seq, uint8_t flags,
+                                    std::size_t payload_len) {
   if (payload_len > kMaxFramePayload) {
     RC_LOGE("conn", "payload exceeds limit: " << payload_len);
-    return nullptr;
+    return false;
   }
-  send_buf_.resize(kFrameHeaderSize + payload_len);
-  uint8_t* out = send_buf_.data();
   out[0] = kProtocolVersion;
   out[1] = static_cast<uint8_t>(type);
   out[2] = flags;
@@ -40,18 +38,21 @@ uint8_t* Connection::write_frame_header(MsgType type, uint64_t session_id,
   out[21] = static_cast<uint8_t>((plen >> 8) & 0xFF);
   out[22] = static_cast<uint8_t>((plen >> 16) & 0xFF);
   out[23] = static_cast<uint8_t>((plen >> 24) & 0xFF);
-  return out + kFrameHeaderSize;
+  return true;
 }
 
 bool Connection::send(MsgType type, uint64_t session_id, const uint8_t* payload,
                       std::size_t length, uint32_t seq, uint8_t flags) {
   std::lock_guard<std::mutex> lock(send_mutex_);
-  uint8_t* dst = write_frame_header(type, session_id, seq, flags, length);
-  if (dst == nullptr) return false;
-  if (length > 0 && payload != nullptr) {
-    std::memcpy(dst, payload, length);
+  uint8_t header[kFrameHeaderSize];
+  if (!build_frame_header(header, type, session_id, seq, flags, length)) return false;
+  if (payload == nullptr || length == 0) {
+    return socket_.send_all(header, kFrameHeaderSize);
   }
-  return socket_.send_all(send_buf_.data(), send_buf_.size());
+  // 帧头与载荷分散写：不再把整帧拷进临时缓冲（中继转发路径最受益）。
+  const uint8_t* buffers[2] = {header, payload};
+  const std::size_t sizes[2] = {kFrameHeaderSize, length};
+  return socket_.send_vectored(buffers, sizes, 2);
 }
 
 bool Connection::send_json(MsgType type, uint64_t session_id,
@@ -66,49 +67,52 @@ bool Connection::send_video_frame(uint64_t session_id, const VideoFrameMeta& met
                                   uint32_t seq) {
   std::lock_guard<std::mutex> lock(send_mutex_);
   const std::size_t video_payload_len = kVideoHeaderBytes + length;
-  uint8_t* payload = write_frame_header(MsgType::VideoFrame, session_id, seq, 0,
-                                        video_payload_len);
-  if (payload == nullptr) return false;
-
-  // 视频头（28 字节）直接写进 payload 区。
-  payload[0] = static_cast<uint8_t>(meta.capture_ts_us & 0xFF);
-  payload[1] = static_cast<uint8_t>((meta.capture_ts_us >> 8) & 0xFF);
-  payload[2] = static_cast<uint8_t>((meta.capture_ts_us >> 16) & 0xFF);
-  payload[3] = static_cast<uint8_t>((meta.capture_ts_us >> 24) & 0xFF);
-  payload[4] = static_cast<uint8_t>((meta.capture_ts_us >> 32) & 0xFF);
-  payload[5] = static_cast<uint8_t>((meta.capture_ts_us >> 40) & 0xFF);
-  payload[6] = static_cast<uint8_t>((meta.capture_ts_us >> 48) & 0xFF);
-  payload[7] = static_cast<uint8_t>((meta.capture_ts_us >> 56) & 0xFF);
-  payload[8] = static_cast<uint8_t>(meta.encode_ts_us & 0xFF);
-  payload[9] = static_cast<uint8_t>((meta.encode_ts_us >> 8) & 0xFF);
-  payload[10] = static_cast<uint8_t>((meta.encode_ts_us >> 16) & 0xFF);
-  payload[11] = static_cast<uint8_t>((meta.encode_ts_us >> 24) & 0xFF);
-  payload[12] = static_cast<uint8_t>((meta.encode_ts_us >> 32) & 0xFF);
-  payload[13] = static_cast<uint8_t>((meta.encode_ts_us >> 40) & 0xFF);
-  payload[14] = static_cast<uint8_t>((meta.encode_ts_us >> 48) & 0xFF);
-  payload[15] = static_cast<uint8_t>((meta.encode_ts_us >> 56) & 0xFF);
-  payload[16] = static_cast<uint8_t>(meta.frame_id & 0xFF);
-  payload[17] = static_cast<uint8_t>((meta.frame_id >> 8) & 0xFF);
-  payload[18] = static_cast<uint8_t>((meta.frame_id >> 16) & 0xFF);
-  payload[19] = static_cast<uint8_t>((meta.frame_id >> 24) & 0xFF);
-  payload[20] = static_cast<uint8_t>(meta.width & 0xFF);
-  payload[21] = static_cast<uint8_t>((meta.width >> 8) & 0xFF);
-  payload[22] = static_cast<uint8_t>(meta.height & 0xFF);
-  payload[23] = static_cast<uint8_t>((meta.height >> 8) & 0xFF);
-  payload[24] = meta.codec;
-  payload[25] = meta.keyframe ? 0x01 : 0x00;
-  payload[26] = 0;
-  payload[27] = 0;
-  const uint32_t dlen = static_cast<uint32_t>(length);
-  payload[28] = static_cast<uint8_t>(dlen & 0xFF);
-  payload[29] = static_cast<uint8_t>((dlen >> 8) & 0xFF);
-  payload[30] = static_cast<uint8_t>((dlen >> 16) & 0xFF);
-  payload[31] = static_cast<uint8_t>((dlen >> 24) & 0xFF);
-
-  if (length > 0 && data != nullptr) {
-    std::memcpy(payload + kVideoHeaderBytes, data, length);
+  uint8_t frame_header[kFrameHeaderSize];
+  if (!build_frame_header(frame_header, MsgType::VideoFrame, session_id, seq, 0,
+                          video_payload_len)) {
+    return false;
   }
-  return socket_.send_all(send_buf_.data(), send_buf_.size());
+
+  // 视频头（32 字节）写在栈缓冲上，随后与码流一起分散写。
+  uint8_t video_header[kVideoHeaderBytes] = {};
+  video_header[0] = static_cast<uint8_t>(meta.capture_ts_us & 0xFF);
+  video_header[1] = static_cast<uint8_t>((meta.capture_ts_us >> 8) & 0xFF);
+  video_header[2] = static_cast<uint8_t>((meta.capture_ts_us >> 16) & 0xFF);
+  video_header[3] = static_cast<uint8_t>((meta.capture_ts_us >> 24) & 0xFF);
+  video_header[4] = static_cast<uint8_t>((meta.capture_ts_us >> 32) & 0xFF);
+  video_header[5] = static_cast<uint8_t>((meta.capture_ts_us >> 40) & 0xFF);
+  video_header[6] = static_cast<uint8_t>((meta.capture_ts_us >> 48) & 0xFF);
+  video_header[7] = static_cast<uint8_t>((meta.capture_ts_us >> 56) & 0xFF);
+  video_header[8] = static_cast<uint8_t>(meta.encode_ts_us & 0xFF);
+  video_header[9] = static_cast<uint8_t>((meta.encode_ts_us >> 8) & 0xFF);
+  video_header[10] = static_cast<uint8_t>((meta.encode_ts_us >> 16) & 0xFF);
+  video_header[11] = static_cast<uint8_t>((meta.encode_ts_us >> 24) & 0xFF);
+  video_header[12] = static_cast<uint8_t>((meta.encode_ts_us >> 32) & 0xFF);
+  video_header[13] = static_cast<uint8_t>((meta.encode_ts_us >> 40) & 0xFF);
+  video_header[14] = static_cast<uint8_t>((meta.encode_ts_us >> 48) & 0xFF);
+  video_header[15] = static_cast<uint8_t>((meta.encode_ts_us >> 56) & 0xFF);
+  video_header[16] = static_cast<uint8_t>(meta.frame_id & 0xFF);
+  video_header[17] = static_cast<uint8_t>((meta.frame_id >> 8) & 0xFF);
+  video_header[18] = static_cast<uint8_t>((meta.frame_id >> 16) & 0xFF);
+  video_header[19] = static_cast<uint8_t>((meta.frame_id >> 24) & 0xFF);
+  video_header[20] = static_cast<uint8_t>(meta.width & 0xFF);
+  video_header[21] = static_cast<uint8_t>((meta.width >> 8) & 0xFF);
+  video_header[22] = static_cast<uint8_t>(meta.height & 0xFF);
+  video_header[23] = static_cast<uint8_t>((meta.height >> 8) & 0xFF);
+  video_header[24] = meta.codec;
+  video_header[25] = meta.keyframe ? 0x01 : 0x00;
+  video_header[26] = 0;
+  video_header[27] = 0;
+  const uint32_t dlen = static_cast<uint32_t>(length);
+  video_header[28] = static_cast<uint8_t>(dlen & 0xFF);
+  video_header[29] = static_cast<uint8_t>((dlen >> 8) & 0xFF);
+  video_header[30] = static_cast<uint8_t>((dlen >> 16) & 0xFF);
+  video_header[31] = static_cast<uint8_t>((dlen >> 24) & 0xFF);
+
+  const uint8_t* buffers[3] = {frame_header, video_header, data};
+  const std::size_t sizes[3] = {kFrameHeaderSize, kVideoHeaderBytes, length};
+  const int count = (data != nullptr && length > 0) ? 3 : 2;
+  return socket_.send_vectored(buffers, sizes, count);
 }
 
 bool Connection::recv(DecodedFrame& out) {
