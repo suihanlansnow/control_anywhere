@@ -17,9 +17,10 @@ void BackendWorker::startHost(const rc::SessionConfig& cfg) {
     QMetaObject::invokeMethod(this, "statusChanged", Qt::QueuedConnection,
                               Q_ARG(QString, QString::fromStdString(state)));
   });
-  host_->set_progress_callback([this](int frames, int bytes) {
+  host_->set_progress_callback([this](int64_t frames, int64_t bytes) {
     QMetaObject::invokeMethod(this, "progressUpdated", Qt::QueuedConnection,
-                              Q_ARG(int, frames), Q_ARG(int, bytes));
+                              Q_ARG(int, static_cast<int>(frames)),
+                              Q_ARG(qlonglong, static_cast<qlonglong>(bytes)));
   });
   int rc = host_->run();
   host_.reset();
@@ -38,9 +39,10 @@ void BackendWorker::startClient(const rc::SessionConfig& cfg) {
     QMetaObject::invokeMethod(this, "statusChanged", Qt::QueuedConnection,
                               Q_ARG(QString, QString::fromStdString(state)));
   });
-  client_->set_progress_callback([this](int frames, int bytes) {
+  client_->set_progress_callback([this](int64_t frames, int64_t bytes) {
     QMetaObject::invokeMethod(this, "progressUpdated", Qt::QueuedConnection,
-                              Q_ARG(int, frames), Q_ARG(int, bytes));
+                              Q_ARG(int, static_cast<int>(frames)),
+                              Q_ARG(qlonglong, static_cast<qlonglong>(bytes)));
   });
   int rc = client_->run();
   client_.reset();

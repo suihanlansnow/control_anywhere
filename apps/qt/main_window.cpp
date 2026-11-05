@@ -805,7 +805,7 @@ void MainWindow::onStatusChanged(const QString& state) {
   }
 }
 
-void MainWindow::onProgressUpdated(int frames, int bytes) {
+void MainWindow::onProgressUpdated(int frames, qlonglong bytes) {
   Q_UNUSED(frames);
   if (badgeCapture_) {
     QString codecText = comboCodec_ ? comboCodec_->currentText() : "H.264";

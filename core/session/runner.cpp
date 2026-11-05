@@ -285,7 +285,7 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
     ++encoded_count;
     // 进度上报已发送的帧数与字节数（发送线程更新），不再恒为 0。
     if (progress_cb_) {
-      progress_cb_(sent_count.load(), static_cast<int>(sent_bytes.load()));
+      progress_cb_(sent_count.load(), static_cast<int64_t>(sent_bytes.load()));
     }
     if (cfg_.max_frames > 0 && encoded_count >= cfg_.max_frames) break;
   }
@@ -567,7 +567,9 @@ int ClientRunner::run() {
 
         ++frames_received;
         bytes_received += frame.payload.size();
-        if (progress_cb_) progress_cb_(frames_received, static_cast<int>(bytes_received));
+        if (progress_cb_) {
+          progress_cb_(frames_received, static_cast<int64_t>(bytes_received));
+        }
 
         if (cfg_.max_frames > 0 && frames_received >= cfg_.max_frames) {
           guard.move_to(SessionState::Closing);

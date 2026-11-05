@@ -25,6 +25,7 @@ struct SessionConfig {
 
 using LogCallback = std::function<void(const std::string& tag, const std::string& level, const std::string& msg)>;
 using StatusCallback = std::function<void(const std::string& state)>;
-using ProgressCallback = std::function<void(int sent, int bytes_total)>;
+// 字节数用 64 位：长时间会话累计会超过 2GB，int 会溢出成负数。
+using ProgressCallback = std::function<void(int64_t sent, int64_t bytes_total)>;
 
 }  // namespace rc

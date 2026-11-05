@@ -21,7 +21,7 @@ class BackendWorker : public QObject {
  signals:
   void logMessage(const QString& tag, const QString& level, const QString& msg);
   void statusChanged(const QString& state);
-  void progressUpdated(int frames, int bytes);
+  void progressUpdated(int frames, qlonglong bytes);
   void finished(int exitCode);
 
  private:

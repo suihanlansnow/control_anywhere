@@ -31,7 +31,7 @@ class MainWindow : public QMainWindow {
   void onSaveSettings();
   void onLogMsg(const QString& tag, const QString& level, const QString& msg);
   void onStatusChanged(const QString& state);
-  void onProgressUpdated(int frames, int bytes);
+  void onProgressUpdated(int frames, qlonglong bytes);
   void onWorkerFinished(int rc);
 
  private:
