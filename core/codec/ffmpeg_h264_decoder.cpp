@@ -45,6 +45,7 @@ void H264Decoder::close() {
   if (ctx_) { avcodec_free_context(&ctx_); ctx_ = nullptr; }
   if (sws_) { sws_freeContext(sws_); sws_ = nullptr; }
   cached_width_ = cached_height_ = 0;
+  ready_.clear();
   opened_ = false;
 }
 
@@ -141,6 +142,13 @@ bool H264Decoder::decode(const uint8_t* data, std::size_t len, int64_t timestamp
     return false;
   }
 
+  // 先把上次 drain 剩下的帧交出去；send_packet 可能解出多帧。
+  if (!ready_.empty()) {
+    out = std::move(ready_.front());
+    ready_.pop_front();
+    return true;
+  }
+
   av_packet_unref(pkt_);
   pkt_->data = const_cast<uint8_t*>(data);
   pkt_->size = static_cast<int>(len);
@@ -153,16 +161,27 @@ bool H264Decoder::decode(const uint8_t* data, std::size_t len, int64_t timestamp
     return false;
   }
 
-  ret = avcodec_receive_frame(ctx_, frame_);
-  if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-    return false;
+  // FFmpeg 解码器可能积压多帧（B 帧重排），全部 drain 进 ready_ 队列。
+  while (true) {
+    ret = avcodec_receive_frame(ctx_, frame_);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+    if (ret < 0) {
+      if (error) *error = "avcodec_receive_frame failed";
+      return false;
+    }
+    DecodedImage picture;
+    if (!convert_frame(frame_, timestamp_us, picture, error)) return false;
+    ready_.push_back(std::move(picture));
   }
-  if (ret < 0) {
-    if (error) *error = "avcodec_receive_frame failed";
+
+  if (ready_.empty()) {
+    // 这一包没解出画面（首帧延迟 / B 帧重排中），不算丢帧——下次会补上。
     return false;
   }
 
-  return convert_frame(frame_, timestamp_us, out, error);
+  out = std::move(ready_.front());
+  ready_.pop_front();
+  return true;
 }
 
 }  // namespace rc

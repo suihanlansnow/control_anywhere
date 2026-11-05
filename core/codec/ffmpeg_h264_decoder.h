@@ -49,6 +49,8 @@ class H264Decoder : public IVideoDecoder {
   int cached_height_ = 0;
   bool want_bgra_ = true;
   bool opened_ = false;
+  // 解码器内部可能积压多帧（B 帧重排 / EAGAIN），用队列缓存避免丢帧。
+  std::deque<DecodedImage> ready_;
 };
 
 }  // namespace rc
