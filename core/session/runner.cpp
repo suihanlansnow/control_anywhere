@@ -85,10 +85,22 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
     }
   }
 
+  // B5: H.264 编码器直接吃 NV12，省掉 8MB 回读和 CPU 逐像素转换。
+  if (cfg_.codec == "h264" && !capture->set_output_format(PixelFormat::kNV12)) {
+    log_("INFO", "host", "capture cannot output nv12, using bgra");
+  }
+
   std::unique_ptr<IVideoEncoder> encoder = create_encoder(cfg_.codec, &error);
   if (!encoder) {
     log_("ERROR", "host", "encoder unavailable: " + error);
     return 0;
+  }
+
+  // B5: 采集与编码共享同一块 D3D11 设备，硬编零回读。
+  if (void* device = capture->native_device(); device != nullptr) {
+    if (!encoder->set_d3d_device(device)) {
+      log_("INFO", "host", "encoder rejected shared d3d device");
+    }
   }
 
   CapturedFrame probe;
@@ -101,55 +113,123 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
     return 0;
   }
 
+  // B5: 采集线程是否交 GPU 纹理由编码器 open 后才能确定；两侧都用原子变量同步。
+  std::atomic<bool> texture_output{encoder->accepts_texture_input()};
+  std::atomic<void*> device_manager{encoder->native_device_manager()};
+
   log_("INFO", "host",
        std::string("capture=") + capture->name() + " codec=" + encoder->name() + " " +
            std::to_string(width) + "x" + std::to_string(height) + " fps=" + std::to_string(fps));
   if (status_cb_) status_cb_("streaming");
 
-  std::mutex slot_mutex;
-  std::condition_variable slot_cv;
-  CapturedFrame latest_frame;
-  bool slot_has_frame = false;
-  int captured_count = 0;
-  int overwritten_count = 0;
-  std::atomic<bool> stop_threads{false};
+  // 采集线程：队列深度 1 + 覆盖旧帧，保证延迟不累积。
+  struct FrameSlot {
+    std::mutex mutex;
+    std::condition_variable cv;
+    CapturedFrame frame;
+    bool has_frame = false;
+    bool stop = false;
+    int captured = 0;
+    int overwritten = 0;
+  };
+  FrameSlot slot;
 
-  std::thread capture_thread([&]() mutable {
-    int frame_interval_ms = std::max(1, 1000 / fps);
-    auto next_tick = std::chrono::steady_clock::now();
-    while (!stop_flag_.load() && !stop_threads.load()) {
-      CapturedFrame frame;
-      if (!capture->grab(frame, frame_interval_ms)) continue;
+  // B2+B3: 发送线程：编码节拍不被网络 send 阻塞；队列深度 1 + 覆盖旧帧。
+  struct SendTask {
+    uint64_t session_id = 0;
+    VideoFrameMeta meta;
+    std::vector<uint8_t> data;
+    uint32_t frame_id = 0;
+  };
+  struct SendSlot {
+    std::mutex mutex;
+    std::condition_variable cv;
+    SendTask task;
+    bool has_frame = false;
+    bool stop = false;
+  };
+  SendSlot send_slot;
+  std::atomic<int> sent_count{0};
+  std::atomic<bool> send_failed{false};
+
+  const int frame_interval_ms = std::max(1, 1000 / fps);
+
+  std::thread capture_thread([&, source = std::move(capture)]() mutable {
+    while (true) {
       {
-        std::lock_guard<std::mutex> lock(slot_mutex);
-        if (slot_has_frame) ++overwritten_count;
-        latest_frame = std::move(frame);
-        slot_has_frame = true;
-        ++captured_count;
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        if (slot.stop) break;
       }
-      slot_cv.notify_one();
-      next_tick += std::chrono::milliseconds(frame_interval_ms);
-      std::this_thread::sleep_until(next_tick);
+      if (void* manager = device_manager.load()) {
+        source->set_device_manager(manager);
+      }
+      source->set_texture_output(texture_output.load());
+      CapturedFrame frame;
+      if (!source->grab(frame, frame_interval_ms)) continue;
+      {
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        if (slot.has_frame) ++slot.overwritten;
+        slot.frame = std::move(frame);
+        slot.has_frame = true;
+        ++slot.captured;
+      }
+      slot.cv.notify_one();
     }
-    capture->stop();
+    source->stop();
   });
 
-  int sent_count = 0;
-  uint64_t sent_bytes = 0;
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+  std::thread send_thread([&]() {
+    while (true) {
+      SendTask task;
+      {
+        std::unique_lock<std::mutex> lock(send_slot.mutex);
+        send_slot.cv.wait(lock, [&] { return send_slot.has_frame || send_slot.stop; });
+        if (send_slot.stop && !send_slot.has_frame) break;
+        task = std::move(send_slot.task);
+        send_slot.has_frame = false;
+      }
+      // B2: 使用 send_video_frame（复用缓冲 + 一次发送），取代 build_video_payload + conn.send。
+      if (!conn.send_video_frame(task.session_id, task.meta, task.data.data(),
+                                 task.data.size(), task.frame_id)) {
+        log_("WARN", "host", "send frame failed");
+        send_failed.store(true);
+        break;
+      }
+      sent_count.fetch_add(1);
+    }
+  });
 
-  while (!stop_flag_.load()) {
+  int encoded_count = 0;
+  uint32_t frame_id = 0;
+  auto next_slot = std::chrono::steady_clock::now();
+  auto frame_interval = std::chrono::milliseconds(frame_interval_ms);
+
+  while (!stop_flag_.load() && !send_failed.load()) {
     CapturedFrame frame;
     {
-      std::unique_lock<std::mutex> lock(slot_mutex);
-      if (!slot_cv.wait_for(lock, std::chrono::milliseconds(500),
-                            [&]() { return slot_has_frame || stop_threads.load(); })) {
-        if (sent_count > 0 && std::chrono::steady_clock::now() > deadline) break;
-        continue;
+      std::unique_lock<std::mutex> lock(slot.mutex);
+      // 等到发帧时点；等待期间只要来了新画面就立刻替换。
+      for (;;) {
+        auto now_point = std::chrono::steady_clock::now();
+        if (now_point >= next_slot) break;
+        auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(next_slot - now_point);
+        if (remain > std::chrono::milliseconds(4)) remain = std::chrono::milliseconds(4);
+        slot.cv.wait_for(lock, remain, [&slot] { return slot.has_frame || slot.stop; });
+        if (slot.stop) { stop_flag_.store(true); break; }
+        if (slot.has_frame) {
+          frame = std::move(slot.frame);
+          slot.has_frame = false;
+          continue;  // 继续等到节拍
+        }
+        // 画面静止时没新帧，直接跳到节拍点
+        break;
       }
-      if (!slot_has_frame) break;
-      frame = std::move(latest_frame);
-      slot_has_frame = false;
+      if (slot.stop) break;
+      if (frame.pixels.empty() && !frame.gpu_texture) continue;
+    }
+    next_slot += frame_interval;
+    if (next_slot < std::chrono::steady_clock::now()) {
+      next_slot = std::chrono::steady_clock::now();
     }
 
     EncodedFrame encoded;
@@ -159,34 +239,56 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
       continue;
     }
 
+    // B3: 每次 encode 后同步 texture_output / device_manager，允许中途切换。
+    device_manager.store(encoder->native_device_manager());
+    texture_output.store(encoder->accepts_texture_input());
+
+    ++frame_id;
     VideoFrameMeta meta;
-    meta.codec = (cfg_.codec == "h264" || cfg_.codec == "h264-soft") ? 1 : 4;
-    meta.width = frame.width;
-    meta.height = frame.height;
+    meta.capture_ts_us = encoded.capture_ts_us;
+    meta.encode_ts_us = encoded.encode_ts_us;
+    meta.frame_id = frame_id;
+    meta.width = static_cast<uint16_t>(encoded.width);
+    meta.height = static_cast<uint16_t>(encoded.height);
+    meta.codec = static_cast<uint8_t>(encoded.codec);
     meta.keyframe = encoded.keyframe;
-    meta.capture_ts_us = frame.capture_ts_us;
-    std::vector<uint8_t> payload = build_video_payload(meta, encoded.data.data(), encoded.data.size());
 
-    if (!conn.send(MsgType::VideoFrame, session_id, payload.data(), payload.size())) {
-      log_("WARN", "host", "send failed, breaking stream");
-      break;
+    // 推送到发送线程，编码节拍不被网络 send 阻塞。
+    {
+      std::lock_guard<std::mutex> lock(send_slot.mutex);
+      send_slot.task.session_id = session_id;
+      send_slot.task.meta = meta;
+      send_slot.task.data = std::move(encoded.data);
+      send_slot.task.frame_id = frame_id;
+      send_slot.has_frame = true;
     }
-    ++sent_count;
-    sent_bytes += payload.size();
-    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+    send_slot.cv.notify_one();
 
-    if (progress_cb_) progress_cb_(sent_count, static_cast<int>(sent_bytes));
-    if (cfg_.max_frames > 0 && sent_count >= cfg_.max_frames) break;
+    ++encoded_count;
+    if (progress_cb_) progress_cb_(encoded_count, 0);
+    if (cfg_.max_frames > 0 && encoded_count >= cfg_.max_frames) break;
   }
 
-  stop_threads.store(true);
-  slot_cv.notify_all();
-  if (capture_thread.joinable()) capture_thread.join();
+  {
+    std::lock_guard<std::mutex> lock(slot.mutex);
+    slot.stop = true;
+  }
+  slot.cv.notify_all();
+  capture_thread.join();
+
+  {
+    std::lock_guard<std::mutex> lock(send_slot.mutex);
+    send_slot.stop = true;
+  }
+  send_slot.cv.notify_all();
+  send_thread.join();
 
   encoder->close();
-  log_("INFO", "host", "frames_sent=" + std::to_string(sent_count) +
-                         " overwritten=" + std::to_string(overwritten_count));
-  return sent_count;
+  log_("INFO", "host", "frames_encoded=" + std::to_string(encoded_count) +
+                         " frames_sent=" + std::to_string(sent_count.load()) +
+                         " captured=" + std::to_string(slot.captured) +
+                         " dropped=" + std::to_string(slot.overwritten));
+  return encoded_count;
 }
 
 int HostRunner::run() {
@@ -423,7 +525,11 @@ int ClientRunner::run() {
         if (!decoder) {
           std::string dec_error;
           decoder = create_decoder(&dec_error);
-          if (decoder) decoder->open(&dec_error);
+          if (decoder) {
+            // B5: 客户端解码器固定输出 BGRA，供后续渲染/落盘。
+            decoder->set_output(IVideoDecoder::Output::kBgra);
+            decoder->open(&dec_error);
+          }
         }
         DecodedImage picture;
         std::string dec_error;
