@@ -497,10 +497,12 @@ int ClientRunner::run() {
   // 队列深度 1，解码跟不上时覆盖旧帧而不是排队累积延迟。
   std::unique_ptr<IRenderer> renderer;
   struct RenderFrame {
-    std::vector<uint8_t> bgra;
+    std::vector<uint8_t> bytes;
     int width = 0;
     int height = 0;
     int stride = 0;
+    int coded_height = 0;
+    bool nv12 = false;
   };
   std::mutex render_mutex;
   RenderFrame render_frame;
@@ -557,7 +559,10 @@ int ClientRunner::run() {
           log_("WARN", "ctrl", "decoder create failed: " + dec_error);
           continue;
         }
-        decoder->set_output(IVideoDecoder::Output::kBgra);
+        // GPU 上屏的渲染器直接吃 NV12，省掉解码后的 NV12->BGRA 转换（实测约 14ms/帧）。
+        const bool nv12_direct = renderer && renderer->gpu() && !frame_cb_;
+        decoder->set_output(nv12_direct ? IVideoDecoder::Output::kNv12
+                                        : IVideoDecoder::Output::kBgra);
         if (!decoder->open(&dec_error)) {
           log_("WARN", "ctrl", "decoder open failed: " + dec_error);
           decoder.reset();
@@ -572,15 +577,19 @@ int ClientRunner::run() {
         frames_decoded.fetch_add(1);
         // 交给上层显示（GUI 在这里做深拷贝再跨线程投递）。
         if (frame_cb_ && !picture.pixels.empty() && !picture.nv12 && picture.stride > 0) {
+          // GUI 需要 BGRA 裸数据，自行深拷贝后跨线程投递。
           frame_cb_(picture.pixels.data(), picture.width, picture.height, picture.stride);
-        } else if (renderer && !picture.pixels.empty() && !picture.nv12 && picture.stride > 0) {
+        } else if (renderer && !picture.pixels.empty() && picture.stride > 0) {
           RenderFrame rf;
-          rf.bgra = picture.pixels;
+          rf.bytes = picture.pixels;
           rf.width = picture.width;
           rf.height = picture.height;
           rf.stride = picture.stride;
+          rf.coded_height = picture.coded_height;
+          rf.nv12 = picture.nv12;
           {
             std::lock_guard<std::mutex> lk(render_mutex);
+            // 渲染帧交给主线程上屏
             render_frame = std::move(rf);
             render_has_frame = true;
           }
@@ -643,7 +652,15 @@ int ClientRunner::run() {
         }
       }
       if (has_frame) {
-        renderer->present(rf.bgra.data(), rf.width, rf.height, rf.stride);
+        if (rf.nv12) {
+          if (!renderer->present_nv12(rf.bytes.data(), rf.width, rf.height,
+                                      rf.coded_height > 0 ? rf.coded_height : rf.height,
+                                      rf.stride)) {
+            log_("WARN", "ctrl", "renderer rejected nv12 frame");
+          }
+        } else {
+          renderer->present(rf.bytes.data(), rf.width, rf.height, rf.stride);
+        }
       }
     }
 
