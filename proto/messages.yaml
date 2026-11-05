@@ -1,0 +1,97 @@
+# 协议唯一真源（M0 版本）
+# 修改后同步 core/protocol/protocol.h 与本文件；M1 起改为代码生成。
+version: 1
+ports:
+  control_tcp: 21116
+  media_udp: 21117
+  admin_http: 21118
+
+frame:
+  header_bytes: 24
+  endian: little
+  fields:
+    - { name: ver,         type: u8,  desc: 固定 1 }
+    - { name: type,        type: u8,  desc: 消息类型 }
+    - { name: flags,       type: u8,  desc: 见 flags }
+    - { name: reserved,    type: u8,  desc: 置 0 }
+    - { name: msg_id,      type: u32, desc: 发送方单调递增，用于去重/ACK }
+    - { name: session_id,  type: u64, desc: 控制面消息为 0 }
+    - { name: seq,         type: u32, desc: 媒体分片序号，否则为 0 }
+    - { name: payload_len, type: u32, desc: 单帧上限 1 MiB }
+  flags:
+    encrypted: 0x01
+    more_fragment: 0x02
+    last_fragment: 0x04
+    compressed: 0x08
+  limits:
+    max_payload_bytes: 1048576
+    fragment_bytes: 65536
+
+messages:
+  - { code: 0x01, name: HELLO_REQ,        dir: client->relay, encoding: json }
+  - { code: 0x02, name: HELLO_RSP,        dir: relay->client, encoding: json }
+  - { code: 0x03, name: REGISTER,         dir: client->relay, encoding: json,
+      fields: [device_id, alias, os, os_ver, app, pub_key, caps] }
+  - { code: 0x04, name: REGISTER_ACK,     dir: relay->client, encoding: json, fields: [ok, device_id, reason] }
+  - { code: 0x05, name: CONNECT_REQ,      dir: controller->relay, encoding: json,
+      fields: [target_id, mode, want] }
+  - { code: 0x06, name: CONNECT_RSP,      dir: relay->controller, encoding: json,
+      fields: [ok, session_id, relay, expire, reason] }
+  - { code: 0x08, name: PING,             dir: both, encoding: json }
+  - { code: 0x09, name: PONG,             dir: both, encoding: json }
+
+  - { code: 0x10, name: SESSION_INVITE,   dir: relay->host, encoding: json,
+      fields: [session_id, from, want] }
+  - { code: 0x11, name: SESSION_ACCEPT,   dir: host->relay, encoding: json, fields: [session_id] }
+  - { code: 0x12, name: SESSION_REJECT,   dir: host->relay, encoding: json, fields: [session_id, reason] }
+  - { code: 0x13, name: AUTH_CHALLENGE,   dir: host->controller, encoding: json,
+      fields: [session_id, nonce, method] }
+  - { code: 0x14, name: AUTH_RESPONSE,    dir: controller->host, encoding: json,
+      fields: [session_id, password_proof, device_sig] }
+  - { code: 0x15, name: AUTH_RESULT,      dir: host->controller, encoding: json, fields: [ok, reason] }
+  - { code: 0x16, name: SESSION_CLOSE,    dir: both, encoding: json, fields: [session_id, reason] }
+  - { code: 0x18, name: CAPS_NEGOTIATE,   dir: both, encoding: json, fields: [codec, max_fps, max_width, quality] }
+
+  - { code: 0x20, name: INPUT_MOUSE_MOVE,   dir: controller->host, encoding: binary,
+      layout: [ts_ms:u32, x:u16, y:u16, display_id:u8, reserved:u8] }
+  - { code: 0x21, name: INPUT_MOUSE_BUTTON, dir: controller->host, encoding: binary,
+      layout: [ts_ms:u32, button:u8, state:u8, x:u16, y:u16, display_id:u8, reserved:u8] }
+  - { code: 0x22, name: INPUT_MOUSE_WHEEL,  dir: controller->host, encoding: binary,
+      layout: [ts_ms:u32, delta_x:i16, delta_y:i16, x:u16, y:u16] }
+  - { code: 0x23, name: INPUT_KEY,          dir: controller->host, encoding: binary,
+      layout: [ts_ms:u32, scancode:u16, state:u8, mods:u8, unicode:u16] }
+  - { code: 0x24, name: INPUT_TEXT,         dir: controller->host, encoding: utf8 }
+  - { code: 0x26, name: INPUT_GESTURE,      dir: controller->host, encoding: json }
+
+  - { code: 0x30, name: VIDEO_CONFIG,       dir: host->controller, encoding: json }
+  - { code: 0x31, name: VIDEO_FRAME,        dir: host->controller, encoding: binary,
+      layout: [capture_ts_us:u64, encode_ts_us:u64, frame_id:u32, width:u16, height:u16,
+               codec:u8, frame_flags:u8, reserved:u16, data_len:u32, data:bytes] }
+  - { code: 0x32, name: KEYFRAME_REQ,       dir: controller->host, encoding: json }
+  - { code: 0x33, name: VIDEO_STATS,        dir: controller->host, encoding: json }
+
+  - { code: 0x50, name: CLIPBOARD_SET,      dir: both, encoding: json }
+  - { code: 0x51, name: CLIPBOARD_DATA,     dir: both, encoding: binary }
+  - { code: 0x52, name: FILE_OFFER,         dir: both, encoding: json }
+  - { code: 0x53, name: FILE_ACCEPT,        dir: both, encoding: json }
+  - { code: 0x54, name: FILE_CHUNK,         dir: both, encoding: binary }
+  - { code: 0x55, name: FILE_END,           dir: both, encoding: json }
+  - { code: 0x56, name: FILE_ABORT,         dir: both, encoding: json }
+
+  - { code: 0x61, name: ERROR,              dir: both, encoding: json, fields: [code, message] }
+
+session_states:
+  host:       [Idle, Registered, Invited, Authing, Ready, Streaming, Closed]
+  controller: [Idle, Registered, Connecting, Authing, Ready, Streaming, Closed]
+
+timeouts:
+  heartbeat_ms: 5000
+  offline_after_ms: 15000
+  degrade_after_ms: 3000
+  close_after_ms: 5000
+
+# M0 简化项（M1 必须补齐）
+m0_deviations:
+  - TLS 未接入：控制面当前为明文 TCP，仅限本机联调
+  - 端到端加密未接入：中继可见会话载荷
+  - 鉴权使用 HMAC-SHA256(sha256(password), nonce)，正式版需 PBKDF2 + Ed25519 设备签名

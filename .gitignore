@@ -1,0 +1,44 @@
+# Build
+build/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake.in
+
+# Qt
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Runtime / temp
+*.log
+*.tmp
+*.bak
+*.swp
+.dbg/
+
+# OS X
+.DS_Store

@@ -1,0 +1,231 @@
+#include "capture/x11_capture.h"
+
+#include <X11/extensions/XShm.h>
+#include <X11/Xutil.h>
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#include <cstring>
+
+#include "base/clock.h"
+#include "base/log.h"
+
+namespace rc {
+
+X11Capture::X11Capture() = default;
+
+X11Capture::~X11Capture() { stop(); }
+
+bool X11Capture::start(int monitor_index, std::string* error) {
+  if (started_) return true;
+
+  display_ = XOpenDisplay(nullptr);
+  if (!display_) {
+    if (error) *error = "XOpenDisplay failed, no X server";
+    return false;
+  }
+
+  screen_ = monitor_index;
+  if (screen_ >= XScreenCount(display_)) {
+    screen_ = 0;
+  }
+
+  Screen* scr = XScreenOfDisplay(display_, screen_);
+  root_ = scr->root;
+  width_ = scr->width;
+  height_ = scr->height;
+
+  RC_LOGI("x11", "screen " << screen_ << " " << width_ << "x" << height_);
+
+  int depth = XDefaultDepth(display_, screen_);
+  Visual* visual = XDefaultVisual(display_, screen_);
+
+  if (XShmQueryExtension(display_)) {
+    XShmSegmentInfo* shm_info = new XShmSegmentInfo{};
+    shm_info_ = shm_info;
+
+    shm_img_ = XShmCreateImage(display_, visual, depth, ZPixmap,
+                                nullptr, shm_info, width_, height_);
+    if (!shm_img_) {
+      RC_LOGW("x11", "XShmCreateImage failed, falling back to XGetImage");
+      delete shm_info;
+      shm_info_ = nullptr;
+    } else {
+      size_t img_size = static_cast<size_t>(shm_img_->bytes_per_line) * shm_img_->height;
+      int shmid = shmget(IPC_PRIVATE, img_size, IPC_CREAT | 0600);
+      if (shmid == -1) {
+        RC_LOGW("x11", "shmget failed, falling back to XGetImage");
+        delete shm_info;
+        shm_info_ = nullptr;
+        XDestroyImage(shm_img_);
+        shm_img_ = nullptr;
+      } else {
+        char* addr = static_cast<char*>(shmat(shmid, nullptr, 0));
+        if (addr == reinterpret_cast<char*>(-1)) {
+          RC_LOGW("x11", "shmat failed, falling back to XGetImage");
+          shmctl(shmid, IPC_RMID, nullptr);
+          delete shm_info;
+          shm_info_ = nullptr;
+          XDestroyImage(shm_img_);
+          shm_img_ = nullptr;
+        } else {
+          shm_info->shmid = shmid;
+          shm_info->shmaddr = addr;
+          shm_img_->data = addr;
+
+          if (!XShmAttach(display_, shm_info)) {
+            RC_LOGW("x11", "XShmAttach failed, falling back to XGetImage");
+            shmdt(addr);
+            shmctl(shmid, IPC_RMID, nullptr);
+            delete shm_info;
+            shm_info_ = nullptr;
+            XDestroyImage(shm_img_);
+            shm_img_ = nullptr;
+          } else {
+            shm_info->readOnly = true;
+            shm_data_ = reinterpret_cast<unsigned char*>(addr);
+            use_xshm_ = true;
+            RC_LOGI("x11", "using XShm shared memory capture");
+          }
+        }
+      }
+    }
+  }
+
+  if (!use_xshm_) {
+    XImage* probe = XGetImage(display_, root_, 0, 0, 1, 1, AllPlanes, ZPixmap);
+    if (probe) {
+      depth_ = probe->depth;
+      bits_per_pixel_ = probe->bits_per_pixel;
+      red_mask_ = probe->red_mask;
+      green_mask_ = probe->green_mask;
+      blue_mask_ = probe->blue_mask;
+      XDestroyImage(probe);
+    }
+  }
+
+  started_ = true;
+  return true;
+}
+
+void X11Capture::stop() {
+  if (!started_) return;
+  started_ = false;
+
+  if (use_xshm_ && shm_info_) {
+    auto* info = static_cast<XShmSegmentInfo*>(shm_info_);
+    XShmDetach(display_, info);
+    if (shm_img_) {
+      shm_img_->data = nullptr;
+      XDestroyImage(shm_img_);
+      shm_img_ = nullptr;
+    }
+    shmdt(info->shmaddr);
+    shmctl(info->shmid, IPC_RMID, nullptr);
+    delete info;
+    shm_info_ = nullptr;
+    shm_data_ = nullptr;
+    use_xshm_ = false;
+  }
+
+  if (display_) {
+    XCloseDisplay(display_);
+    display_ = nullptr;
+  }
+}
+
+static bool ximage_to_bgra_fast(XImage* img, CapturedFrame& frame) {
+  int w = img->width;
+  int h = img->height;
+  int bpl = img->bytes_per_line;
+
+  frame.width = w;
+  frame.height = h;
+  frame.stride = w * 4;
+  frame.format = PixelFormat::kBGRA;
+  frame.pixels.resize(static_cast<size_t>(w) * h * 4);
+
+  uint32_t rmask = img->red_mask;
+  uint32_t gmask = img->green_mask;
+  uint32_t bmask = img->blue_mask;
+
+  if (img->bits_per_pixel == 32 &&
+      rmask == 0x00FF0000 && gmask == 0x0000FF00 && bmask == 0x000000FF) {
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(img->data);
+    for (int y = 0; y < h; ++y) {
+      std::memcpy(frame.pixels.data() + y * frame.stride,
+                  data + y * bpl, w * 4);
+    }
+    return true;
+  }
+
+  int rshift = 0, gshift = 0, bshift = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (rmask & (1u << i)) rshift = i;
+    if (gmask & (1u << i)) gshift = i;
+    if (bmask & (1u << i)) bshift = i;
+  }
+
+  const uint8_t* data = reinterpret_cast<const uint8_t*>(img->data);
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* src_row = data + y * bpl;
+    uint8_t* dst_row = frame.pixels.data() + y * frame.stride;
+    for (int x = 0; x < w; ++x) {
+      uint32_t pixel = 0;
+      if (img->bits_per_pixel == 32) {
+        pixel = *reinterpret_cast<const uint32_t*>(src_row + x * 4);
+      } else if (img->bits_per_pixel == 16) {
+        pixel = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(src_row + x * 2));
+      } else {
+        pixel = 0;
+      }
+      uint8_t r = static_cast<uint8_t>((pixel & rmask) >> rshift);
+      uint8_t g = static_cast<uint8_t>((pixel & gmask) >> gshift);
+      uint8_t b = static_cast<uint8_t>((pixel & bmask) >> bshift);
+      dst_row[x * 4 + 0] = b;
+      dst_row[x * 4 + 1] = g;
+      dst_row[x * 4 + 2] = r;
+      dst_row[x * 4 + 3] = 0xFF;
+    }
+  }
+  return true;
+}
+
+bool X11Capture::grab(CapturedFrame& frame, int timeout_ms) {
+  if (!started_ || !display_) return false;
+
+  XImage* img = nullptr;
+
+  if (use_xshm_ && shm_img_) {
+    if (!XShmGetImage(display_, root_, shm_img_, 0, 0, AllPlanes)) {
+      RC_LOGW("x11", "XShmGetImage failed, falling back to XGetImage");
+      use_xshm_ = false;
+    } else {
+      img = shm_img_;
+    }
+  }
+
+  if (!img) {
+    img = XGetImage(display_, root_, 0, 0, width_, height_, AllPlanes, ZPixmap);
+    if (!img) {
+      RC_LOGW("x11", "XGetImage failed");
+      return false;
+    }
+  }
+
+  frame.capture_ts_us = static_cast<int64_t>(now_us());
+  ximage_to_bgra_fast(img, frame);
+
+  if (!use_xshm_) {
+    XDestroyImage(img);
+  }
+  return true;
+}
+
+bool X11Capture::set_output_format(PixelFormat format) {
+  desired_format_ = format;
+  return format == PixelFormat::kBGRA;
+}
+
+}  // namespace rc

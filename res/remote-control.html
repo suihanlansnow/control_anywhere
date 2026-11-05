@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>远程控制 · 设置</title>
+<style>
+  :root {
+    --bg: #eef1f5;
+    --surface: #ffffff;
+    --surface-2: #f7f9fb;
+    --border: #e4e8ed;
+    --text: #1f2933;
+    --text-muted: #6b7684;
+    --accent: #2e9e5b;
+    --accent-soft: #e6f4ec;
+    --accent-strong: #1f7a45;
+    --danger: #d9534f;
+    --radius: 14px;
+    --radius-sm: 9px;
+    --shadow: 0 2px 12px rgba(31, 41, 51, 0.08);
+    --shadow-lg: 0 8px 32px rgba(31, 41, 51, 0.12);
+    --transition: 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body { height: 100%; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .app {
+    display: flex;
+    width: 100%;
+    max-width: 960px;
+    height: min(720px, calc(100vh - 48px));
+    background: var(--surface);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+  }
+
+  /* ---------- 侧边栏 ---------- */
+  .sidebar {
+    width: 230px;
+    flex-shrink: 0;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 20px 14px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px 18px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .brand-logo {
+    width: 34px; height: 34px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, #2e9e5b, #1f7a45);
+    display: grid; place-items: center;
+    color: #fff;
+    flex-shrink: 0;
+  }
+  .brand-title { font-size: 15px; font-weight: 600; letter-spacing: 0.3px; }
+  .brand-sub { font-size: 11px; color: var(--text-muted); }
+
+  .nav { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    color: var(--text-muted);
+    font-weight: 500;
+    transition: background var(--transition), color var(--transition);
+    user-select: none;
+  }
+  .nav-item:hover { background: var(--surface-2); color: var(--text); }
+  .nav-item.active {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-weight: 600;
+  }
+  .nav-item svg { width: 20px; height: 20px; flex-shrink: 0; stroke-width: 1.8; }
+
+  .sidebar-footer {
+    margin-top: auto;
+    padding: 12px 10px 4px;
+    font-size: 12px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #34c759;
+    box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.18);
+  }
+
+  /* ---------- 主内容 ---------- */
+  .main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 28px 32px;
+    background: var(--surface-2);
+  }
+
+  .panel { display: none; animation: fadeIn 0.25s ease; }
+  .panel.active { display: block; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .panel-header { margin-bottom: 22px; }
+  .panel-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .panel-desc { color: var(--text-muted); font-size: 13px; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
+  }
+  .card-title {
+    font-size: 14px; font-weight: 600;
+    margin-bottom: 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card-title::before {
+    content: "";
+    width: 3px; height: 14px;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+
+  /* 表单项 */
+  .field { margin-bottom: 16px; }
+  .field:last-child { margin-bottom: 0; }
+  .field-label {
+    display: block;
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+    font-weight: 500;
+  }
+  .field-hint { font-size: 12px; color: var(--text-muted); margin-top: 5px; }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  select {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    transition: border-color var(--transition), box-shadow var(--transition);
+  }
+  input:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(46, 158, 91, 0.12);
+  }
+
+  .row { display: flex; gap: 14px; }
+  .row .field { flex: 1; }
+
+  /* 开关 */
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+  }
+  .toggle-row + .toggle-row { border-top: 1px solid var(--border); }
+  .toggle-label { font-size: 14px; }
+  .toggle-label small { display: block; color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+
+  .switch {
+    position: relative;
+    width: 42px; height: 24px;
+    background: #cfd6de;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background var(--transition);
+    flex-shrink: 0;
+  }
+  .switch::after {
+    content: "";
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 20px; height: 20px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform var(--transition);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  }
+  .switch.on { background: var(--accent); }
+  .switch.on::after { transform: translateX(18px); }
+
+  /* 滑块 */
+  .slider-row { display: flex; align-items: center; gap: 12px; }
+  input[type="range"] {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+  }
+  .slider-value {
+    min-width: 44px;
+    text-align: center;
+    font-weight: 600;
+    color: var(--accent-strong);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 按钮 */
+  .btn {
+    padding: 9px 18px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--transition), transform var(--transition);
+    font-family: inherit;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-strong); }
+  .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+  .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
+  .btn-danger { background: var(--danger); color: #fff; }
+  .btn-danger:hover { background: #c0392b; }
+  .btn-row { display: flex; gap: 10px; margin-top: 20px; }
+
+  /* 状态徽章 */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge-ok { background: #e6f4ec; color: var(--accent-strong); }
+  .badge-warn { background: #fff4e5; color: #b7791f; }
+  .badge-off { background: #f1f3f5; color: var(--text-muted); }
+
+  /* 关于页 */
+  .about-hero {
+    text-align: center;
+    padding: 20px 0 10px;
+  }
+  .about-logo {
+    width: 64px; height: 64px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, #2e9e5b, #1f7a45);
+    margin: 0 auto 14px;
+    display: grid; place-items: center;
+    color: #fff;
+    box-shadow: 0 6px 20px rgba(46, 158, 91, 0.3);
+  }
+  .about-name { font-size: 20px; font-weight: 700; }
+  .about-ver { color: var(--text-muted); font-size: 13px; margin-top: 2px; }
+
+  .info-list { list-style: none; }
+  .info-list li {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .info-list li:last-child { border-bottom: none; }
+  .info-list span:first-child { color: var(--text-muted); }
+  .info-list span:last-child { font-weight: 500; }
+
+  @media (max-width: 720px) {
+    body { padding: 0; }
+    .app { flex-direction: column; height: 100vh; border-radius: 0; }
+    .sidebar {
+      width: 100%;
+      flex-direction: row;
+      overflow-x: auto;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      padding: 10px;
+    }
+    .brand { display: none; }
+    .sidebar-footer { display: none; }
+    .nav { flex-direction: row; }
+    .nav-item { white-space: nowrap; }
+    .main { padding: 20px 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- 侧边栏 -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2"/>
+          <path d="M8 21h8M12 17v4"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-title">远程控制</div>
+        <div class="brand-sub">Remote Control</div>
+      </div>
+    </div>
+
+    <ul class="nav" id="nav">
+      <li class="nav-item active" data-panel="security">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>
+        安全
+      </li>
+      <li class="nav-item" data-panel="display">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2"/>
+          <path d="M8 21h8M12 17v4"/>
+        </svg>
+        显示
+      </li>
+      <li class="nav-item" data-panel="network">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+          <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+          <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+          <line x1="12" y1="20" x2="12.01" y2="20"/>
+        </svg>
+        网络
+      </li>
+      <li class="nav-item" data-panel="permission">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+        权限
+      </li>
+      <li class="nav-item" data-panel="about">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+        关于
+      </li>
+    </ul>
+
+    <div class="sidebar-footer">
+      <span class="status-dot"></span>
+      <span id="conn-status">已连接</span>
+    </div>
+  </aside>
+
+  <!-- 主内容 -->
+  <main class="main">
+
+    <!-- 安全 -->
+    <section class="panel active" id="panel-security">
+      <div class="panel-header">
+        <h2 class="panel-title">安全</h2>
+        <p class="panel-desc">配置连接认证与加密，保护远程会话安全。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title">连接认证</div>
+        <div class="field">
+          <label class="field-label">连接密码</label>
+          <input type="password" id="password" placeholder="输入连接密码" />
+          <p class="field-hint">长度不少于 6 位，建议包含字母与数字组合。</p>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            强制密码保护
+            <small>未经授权的连接将被拒绝</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">传输加密</div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            AES-256 加密
+            <small>所有帧数据与控制指令均加密传输</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            证书验证
+            <small>中继服务器证书校验（防止中间人攻击）</small>
+          </div>
+          <div class="switch" data-toggle></div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveSettings()">保存</button>
+        <button class="btn btn-ghost" onclick="resetSection('security')">重置</button>
+      </div>
+    </section>
+
+    <!-- 显示 -->
+    <section class="panel" id="panel-display">
+      <div class="panel-header">
+        <h2 class="panel-title">显示</h2>
+        <p class="panel-desc">调整画面分辨率、帧率与编码质量。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title">画面质量</div>
+        <div class="field">
+          <label class="field-label">分辨率</label>
+          <select id="resolution">
+            <option value="1920x1080">1920 × 1080（推荐）</option>
+            <option value="2560x1440">2560 × 1440</option>
+            <option value="3840x2160">3840 × 2160</option>
+            <option value="1280x720">1280 × 720</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field-label">帧率</label>
+          <div class="slider-row">
+            <input type="range" id="fps" min="15" max="120" value="60" />
+            <span class="slider-value" id="fps-val">60 fps</span>
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">编码质量</label>
+          <div class="slider-row">
+            <input type="range" id="quality" min="1" max="100" value="80" />
+            <span class="slider-value" id="quality-val">80</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">编码与渲染</div>
+        <div class="row">
+          <div class="field">
+            <label class="field-label">视频编码</label>
+            <select id="codec">
+              <option value="h264">H.264（硬件加速）</option>
+              <option value="h264-soft">H.264（软件编码）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label">渲染模式</label>
+            <select id="render">
+              <option value="gpu">GPU 直出（零拷贝）</option>
+              <option value="cpu">CPU 回读</option>
+            </select>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            自适应码率
+            <small>网络波动时自动降低码率保证流畅</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveSettings()">保存</button>
+        <button class="btn btn-ghost" onclick="resetSection('display')">重置</button>
+      </div>
+    </section>
+
+    <!-- 网络 -->
+    <section class="panel" id="panel-network">
+      <div class="panel-header">
+        <h2 class="panel-title">网络</h2>
+        <p class="panel-desc">配置中继服务器与连接参数。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title">中继服务器</div>
+        <div class="row">
+          <div class="field">
+            <label class="field-label">服务器地址</label>
+            <input type="text" id="relay-host" value="relay.example.com" />
+          </div>
+          <div class="field" style="max-width:110px">
+            <label class="field-label">端口</label>
+            <input type="number" id="relay-port" value="9000" />
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label">会话 ID</label>
+          <input type="text" id="session-id" value="A1B2-C3D4-E5F6" readonly />
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">连接参数</div>
+        <div class="field">
+          <label class="field-label">连接超时（秒）</label>
+          <div class="slider-row">
+            <input type="range" id="timeout" min="3" max="30" value="10" />
+            <span class="slider-value" id="timeout-val">10s</span>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            自动重连
+            <small>断开后自动尝试重新连接</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            TCP_NODELAY
+            <small>禁用 Nagle 算法，降低交互延迟</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveSettings()">保存</button>
+        <button class="btn btn-ghost" onclick="testConnection()">测试连接</button>
+      </div>
+    </section>
+
+    <!-- 权限 -->
+    <section class="panel" id="panel-permission">
+      <div class="panel-header">
+        <h2 class="panel-title">权限</h2>
+        <p class="panel-desc">控制远程端可执行的操作范围。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title">输入控制</div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            键盘输入
+            <small>允许远程端发送键盘事件</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            鼠标控制
+            <small>允许远程端移动鼠标与点击</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            剪贴板同步
+            <small>双向同步剪贴板内容</small>
+          </div>
+          <div class="switch" data-toggle></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">系统权限</div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            文件传输
+            <small>允许在两端间传输文件</small>
+          </div>
+          <div class="switch" data-toggle></div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            音频传输
+            <small>传输远程端音频输出</small>
+          </div>
+          <div class="switch" data-toggle></div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label">
+            多显示器
+            <small>允许切换远程显示器</small>
+          </div>
+          <div class="switch on" data-toggle></div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveSettings()">保存</button>
+        <button class="btn btn-ghost" onclick="resetSection('permission')">重置</button>
+      </div>
+    </section>
+
+    <!-- 关于 -->
+    <section class="panel" id="panel-about">
+      <div class="about-hero">
+        <div class="about-logo">
+          <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <path d="M8 21h8M12 17v4"/>
+          </svg>
+        </div>
+        <div class="about-name">远程控制</div>
+        <div class="about-ver">版本 0.1.0</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">系统信息</div>
+        <ul class="info-list">
+          <li><span>版本</span><span>0.1.0</span></li>
+          <li><span>协议</span><span>rc-frame v1</span></li>
+          <li><span>编码器</span><span>H.264 / JPEG</span></li>
+          <li><span>平台</span><span id="platform">Windows / Linux</span></li>
+          <li><span>构建类型</span><span>Release</span></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-title">运行状态</div>
+        <ul class="info-list">
+          <li><span>连接状态</span><span class="badge badge-ok">● 已连接</span></li>
+          <li><span>采集</span><span class="badge badge-ok">1920×1080 @ 60fps</span></li>
+          <li><span>编码</span><span class="badge badge-ok">H.264 硬编</span></li>
+          <li><span>网络延迟</span><span>12 ms</span></li>
+          <li><span>丢帧率</span><span class="badge badge-ok">0.0%</span></li>
+        </ul>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-ghost" onclick="checkUpdate()">检查更新</button>
+        <button class="btn btn-danger" onclick="disconnect()">断开连接</button>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  // 面板切换
+  const navItems = document.querySelectorAll('.nav-item');
+  const panels = document.querySelectorAll('.panel');
+  navItems.forEach(item => {
+    item.addEventListener('click', () => {
+      navItems.forEach(i => i.classList.remove('active'));
+      panels.forEach(p => p.classList.remove('active'));
+      item.classList.add('active');
+      document.getElementById('panel-' + item.dataset.panel).classList.add('active');
+    });
+  });
+
+  // 开关
+  document.querySelectorAll('[data-toggle]').forEach(sw => {
+    sw.addEventListener('click', () => sw.classList.toggle('on'));
+  });
+
+  // 滑块实时值
+  const bindSlider = (id, suffix) => {
+    const el = document.getElementById(id);
+    const val = document.getElementById(id + '-val');
+    el.addEventListener('input', () => {
+      val.textContent = el.value + suffix;
+    });
+  };
+  bindSlider('fps', ' fps');
+  bindSlider('quality', '');
+  bindSlider('timeout', 's');
+
+  // 操作反馈（纯前端模拟）
+  function toast(msg) {
+    const el = document.createElement('div');
+    el.textContent = msg;
+    Object.assign(el.style, {
+      position: 'fixed', bottom: '28px', left: '50%',
+      transform: 'translateX(-50%)',
+      background: 'var(--text)', color: '#fff',
+      padding: '10px 20px', borderRadius: '8px',
+      fontSize: '13px', zIndex: 999, opacity: '0',
+      transition: 'opacity 0.25s', boxShadow: 'var(--shadow-lg)'
+    });
+    document.body.appendChild(el);
+    requestAnimationFrame(() => el.style.opacity = '1');
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 1800);
+  }
+
+  function saveSettings() { toast('设置已保存'); }
+  function resetSection(name) { toast('已重置 ' + name); }
+  function testConnection() { toast('正在测试连接…'); setTimeout(() => toast('连接正常 (12ms)'), 800); }
+  function checkUpdate() { toast('当前已是最新版本'); }
+  function disconnect() { toast('已断开连接'); }
+</script>
+
+</body>
+</html>

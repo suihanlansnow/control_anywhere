@@ -1,0 +1,53 @@
+#include "backend_worker.h"
+
+#include <QMetaObject>
+
+BackendWorker::BackendWorker(QObject* parent) : QObject(parent) {}
+BackendWorker::~BackendWorker() { stop(); }
+
+void BackendWorker::startHost(const rc::SessionConfig& cfg) {
+  host_ = std::make_unique<rc::HostRunner>(cfg);
+  host_->set_log_callback([this](const std::string& tag, const std::string& level, const std::string& msg) {
+    QMetaObject::invokeMethod(this, "logMessage", Qt::QueuedConnection,
+                              Q_ARG(QString, QString::fromStdString(tag)),
+                              Q_ARG(QString, QString::fromStdString(level)),
+                              Q_ARG(QString, QString::fromStdString(msg)));
+  });
+  host_->set_status_callback([this](const std::string& state) {
+    QMetaObject::invokeMethod(this, "statusChanged", Qt::QueuedConnection,
+                              Q_ARG(QString, QString::fromStdString(state)));
+  });
+  host_->set_progress_callback([this](int frames, int bytes) {
+    QMetaObject::invokeMethod(this, "progressUpdated", Qt::QueuedConnection,
+                              Q_ARG(int, frames), Q_ARG(int, bytes));
+  });
+  int rc = host_->run();
+  host_.reset();
+  emit finished(rc);
+}
+
+void BackendWorker::startClient(const rc::SessionConfig& cfg) {
+  client_ = std::make_unique<rc::ClientRunner>(cfg);
+  client_->set_log_callback([this](const std::string& tag, const std::string& level, const std::string& msg) {
+    QMetaObject::invokeMethod(this, "logMessage", Qt::QueuedConnection,
+                              Q_ARG(QString, QString::fromStdString(tag)),
+                              Q_ARG(QString, QString::fromStdString(level)),
+                              Q_ARG(QString, QString::fromStdString(msg)));
+  });
+  client_->set_status_callback([this](const std::string& state) {
+    QMetaObject::invokeMethod(this, "statusChanged", Qt::QueuedConnection,
+                              Q_ARG(QString, QString::fromStdString(state)));
+  });
+  client_->set_progress_callback([this](int frames, int bytes) {
+    QMetaObject::invokeMethod(this, "progressUpdated", Qt::QueuedConnection,
+                              Q_ARG(int, frames), Q_ARG(int, bytes));
+  });
+  int rc = client_->run();
+  client_.reset();
+  emit finished(rc);
+}
+
+void BackendWorker::stop() {
+  if (host_) host_->stop();
+  if (client_) client_->stop();
+}

@@ -1,0 +1,261 @@
+* {
+    font-family: -apple-system, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    color: #1f2933;
+}
+
+QMainWindow {
+    background: #eef1f5;
+}
+
+/* ---------- 侧边栏 ---------- */
+#Sidebar {
+    background: #ffffff;
+    border-right: 1px solid #e4e8ed;
+}
+
+#BrandTitle {
+    font-size: 14px;
+    font-weight: 600;
+    color: #1f2933;
+}
+
+#BrandSub {
+    font-size: 10px;
+    color: #6b7684;
+}
+
+#BrandLogo {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #2e9e5b, stop:1 #1f7a45);
+    border-radius: 8px;
+    color: #ffffff;
+    font-size: 16px;
+    font-weight: bold;
+}
+
+#NavList QPushButton {
+    background: transparent;
+    border: none;
+    border-radius: 7px;
+    padding: 9px 12px;
+    text-align: left;
+    color: #6b7684;
+    font-weight: 500;
+}
+
+#NavList QPushButton:hover {
+    background: #f7f9fb;
+    color: #1f2933;
+}
+
+#NavList QPushButton:checked {
+    background: #e6f4ec;
+    color: #1f7a45;
+    font-weight: 600;
+}
+
+#SidebarFooter {
+    color: #6b7684;
+    font-size: 11px;
+}
+
+#StatusDot {
+    background: #34c759;
+    border-radius: 4px;
+}
+
+/* ---------- 主内容 ---------- */
+#MainContent {
+    background: #f7f9fb;
+}
+
+#PanelTitle {
+    font-size: 18px;
+    font-weight: 700;
+    color: #1f2933;
+}
+
+#PanelDesc {
+    font-size: 12px;
+    color: #6b7684;
+}
+
+/* 卡片 */
+#Card {
+    background: #ffffff;
+    border: 1px solid #e4e8ed;
+    border-radius: 10px;
+}
+
+#CardTitle {
+    font-size: 13px;
+    font-weight: 600;
+    color: #1f2933;
+}
+
+#CardTitleBar {
+    background: #2e9e5b;
+    border-radius: 1px;
+}
+
+/* 表单 */
+#FieldLabel {
+    font-size: 12px;
+    color: #6b7684;
+    font-weight: 500;
+}
+
+#FieldHint {
+    font-size: 11px;
+    color: #6b7684;
+}
+
+QLineEdit, QSpinBox, QComboBox {
+    background: #ffffff;
+    border: 1px solid #e4e8ed;
+    border-radius: 7px;
+    padding: 7px 10px;
+    color: #1f2933;
+    selection-background-color: #2e9e5b;
+    selection-color: #ffffff;
+}
+
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+    border: 1px solid #2e9e5b;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+
+/* 开关 */
+#Switch {
+    width: 42px;
+    height: 24px;
+    background: #cfd6de;
+    border-radius: 12px;
+}
+
+/* 滑块 */
+QSlider::groove:horizontal {
+    height: 6px;
+    background: #e4e8ed;
+    border-radius: 3px;
+}
+
+QSlider::sub-page:horizontal {
+    background: #2e9e5b;
+    border-radius: 3px;
+}
+
+QSlider::handle:horizontal {
+    width: 16px;
+    height: 16px;
+    margin: -5px 0;
+    border-radius: 9px;
+    background: #2e9e5b;
+}
+
+/* 按钮 */
+#BtnPrimary {
+    background: #2e9e5b;
+    color: #ffffff;
+    border: none;
+    border-radius: 7px;
+    padding: 8px 16px;
+    font-weight: 600;
+}
+
+#BtnPrimary:hover {
+    background: #1f7a45;
+}
+
+#BtnGhost {
+    background: transparent;
+    color: #6b7684;
+    border: 1px solid #e4e8ed;
+    border-radius: 7px;
+    padding: 8px 16px;
+    font-weight: 600;
+}
+
+#BtnGhost:hover {
+    background: #f7f9fb;
+    color: #1f2933;
+}
+
+#BtnDanger {
+    background: #d9534f;
+    color: #ffffff;
+    border: none;
+    border-radius: 7px;
+    padding: 8px 16px;
+    font-weight: 600;
+}
+
+#BtnDanger:hover {
+    background: #c0392b;
+}
+
+/* 徽章 */
+#BadgeOk {
+    background: #e6f4ec;
+    color: #1f7a45;
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+#BadgeWarn {
+    background: #fff4e5;
+    color: #b7791f;
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+#BadgeOff {
+    background: #f1f3f5;
+    color: #6b7684;
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+/* 关于页 */
+#AboutLogo {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #2e9e5b, stop:1 #1f7a45);
+    border-radius: 12px;
+    color: #ffffff;
+    font-size: 28px;
+    font-weight: bold;
+}
+
+#AboutName {
+    font-size: 18px;
+    font-weight: 700;
+}
+
+#AboutVer {
+    font-size: 12px;
+    color: #6b7684;
+}
+
+/* Info list */
+#InfoRowName {
+    color: #6b7684;
+    font-size: 12px;
+}
+
+#InfoRowValue {
+    color: #1f2933;
+    font-size: 12px;
+    font-weight: 500;
+}
