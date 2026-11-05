@@ -150,6 +150,7 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   };
   SendSlot send_slot;
   std::atomic<int> sent_count{0};
+  std::atomic<uint64_t> sent_bytes{0};
   std::atomic<bool> send_failed{false};
 
   const int frame_interval_ms = std::max(1, 1000 / fps);
@@ -195,6 +196,7 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
         send_failed.store(true);
         break;
       }
+      sent_bytes.fetch_add(task.data.size());
       sent_count.fetch_add(1);
     }
   });
@@ -265,7 +267,10 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
     send_slot.cv.notify_one();
 
     ++encoded_count;
-    if (progress_cb_) progress_cb_(encoded_count, 0);
+    // 进度上报已发送的帧数与字节数（发送线程更新），不再恒为 0。
+    if (progress_cb_) {
+      progress_cb_(sent_count.load(), static_cast<int>(sent_bytes.load()));
+    }
     if (cfg_.max_frames > 0 && encoded_count >= cfg_.max_frames) break;
   }
 
