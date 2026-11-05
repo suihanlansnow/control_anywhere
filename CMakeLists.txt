@@ -110,23 +110,26 @@ endif()
 if(UNIX AND NOT APPLE)
   target_sources(rc-cli PRIVATE core/render/sdl_renderer.cpp)
 
-  find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
+  option(ENABLE_QT "Build Qt5 GUI app (rc-app)" ON)
+  if(ENABLE_QT)
+    find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
 
-  set(CMAKE_AUTOMOC ON)
-  set(CMAKE_AUTOUIC ON)
-  set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTOUIC ON)
+    set(CMAKE_AUTORCC ON)
 
-  add_executable(rc-app
-    apps/qt/main.cpp
-    apps/qt/main_window.cpp
-    apps/qt/backend_worker.cpp
-  )
-  target_include_directories(rc-app PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/apps/qt
-  )
-  target_link_libraries(rc-app PRIVATE
-    rc_core
-    Qt5::Core Qt5::Gui Qt5::Widgets
-  )
+    add_executable(rc-app
+      apps/qt/main.cpp
+      apps/qt/main_window.cpp
+      apps/qt/backend_worker.cpp
+    )
+    target_include_directories(rc-app PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/apps/qt
+    )
+    target_link_libraries(rc-app PRIVATE
+      rc_core
+      Qt5::Core Qt5::Gui Qt5::Widgets
+    )
+  endif()
 endif()
 target_link_libraries(rc-cli PRIVATE rc_core)
