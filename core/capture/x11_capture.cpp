@@ -6,7 +6,9 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "base/clock.h"
 #include "base/log.h"
@@ -133,6 +135,7 @@ void X11Capture::stop() {
     XCloseDisplay(display_);
     display_ = nullptr;
   }
+  last_grab_us_ = 0;
 }
 
 static bool ximage_to_bgra_fast(XImage* img, CapturedFrame& frame) {
@@ -195,6 +198,16 @@ static bool ximage_to_bgra_fast(XImage* img, CapturedFrame& frame) {
 bool X11Capture::grab(CapturedFrame& frame, int timeout_ms) {
   if (!started_ || !display_) return false;
 
+  // 按调用方给的间隔节流，模拟“等新帧”的语义，避免空转。
+  if (timeout_ms > 0 && last_grab_us_ != 0) {
+    const uint64_t period_us = static_cast<uint64_t>(timeout_ms) * 1000ULL;
+    const uint64_t now = now_us();
+    const uint64_t elapsed = now - last_grab_us_;
+    if (elapsed < period_us) {
+      std::this_thread::sleep_for(std::chrono::microseconds(period_us - elapsed));
+    }
+  }
+
   XImage* img = nullptr;
 
   if (use_xshm_ && shm_img_) {
@@ -225,6 +238,7 @@ bool X11Capture::grab(CapturedFrame& frame, int timeout_ms) {
   if (!use_xshm_) {
     XDestroyImage(img);
   }
+  last_grab_us_ = now_us();
   return true;
 }
 

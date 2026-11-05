@@ -42,6 +42,9 @@ class X11Capture : public ICaptureSource {
 
   PixelFormat desired_format_ = PixelFormat::kBGRA;
   bool started_ = false;
+  // grab() 按 timeout_ms 节流：X11 没有“等新画面”的事件接口，
+  // 不节流就会空转抓同一帧，白烧一整核 CPU。
+  uint64_t last_grab_us_ = 0;
 };
 
 }  // namespace rc
