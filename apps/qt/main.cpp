@@ -1,6 +1,5 @@
 #include <QApplication>
 #include <QFile>
-#include <QTextStream>
 
 #include "main_window.h"
 
@@ -9,16 +8,10 @@ int main(int argc, char* argv[]) {
   app.setApplicationName("远程控制");
   app.setApplicationVersion("0.1.0");
 
+  // 样式表编译进二进制（resources.qrc），Windows/Linux 表现完全一致。
   QFile qss(":/style.qss");
-  if (qss.exists() && qss.open(QIODevice::ReadOnly)) {
+  if (qss.open(QIODevice::ReadOnly)) {
     app.setStyleSheet(qss.readAll());
-    qss.close();
-  } else {
-    QFile localQss("apps/qt/style.qss");
-    if (localQss.open(QIODevice::ReadOnly)) {
-      app.setStyleSheet(localQss.readAll());
-      localQss.close();
-    }
   }
 
   MainWindow w;

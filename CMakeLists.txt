@@ -8,7 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
   add_compile_options(/utf-8 /W3)
-  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+  # NOMINMAX：避免 windows.h 的 max/min 宏污染 std::max/std::min。
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
 endif()
@@ -111,27 +112,32 @@ if(WIN32)
 endif()
 if(UNIX AND NOT APPLE)
   target_sources(rc-cli PRIVATE core/render/sdl_renderer.cpp)
-
-  option(ENABLE_QT "Build Qt5 GUI app (rc-app)" ON)
-  if(ENABLE_QT)
-    find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
-
-    set(CMAKE_AUTOMOC ON)
-    set(CMAKE_AUTOUIC ON)
-    set(CMAKE_AUTORCC ON)
-
-    add_executable(rc-app
-      apps/qt/main.cpp
-      apps/qt/main_window.cpp
-      apps/qt/backend_worker.cpp
-    )
-    target_include_directories(rc-app PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/apps/qt
-    )
-    target_link_libraries(rc-app PRIVATE
-      rc_core
-      Qt5::Core Qt5::Gui Qt5::Widgets
-    )
-  endif()
 endif()
 target_link_libraries(rc-cli PRIVATE rc_core)
+
+# 桌面 UI 统一用 Qt5：Windows / Linux 共用同一套界面代码与样式。
+option(ENABLE_QT "Build Qt5 GUI app (rc-app)" ON)
+if(ENABLE_QT)
+  find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
+
+  add_executable(rc-app
+    apps/qt/main.cpp
+    apps/qt/main_window.cpp
+    apps/qt/backend_worker.cpp
+    apps/qt/resources.qrc
+  )
+  set_target_properties(rc-app PROPERTIES
+    AUTOMOC ON AUTOUIC ON AUTORCC ON
+  )
+  target_include_directories(rc-app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/qt
+  )
+  target_link_libraries(rc-app PRIVATE
+    rc_core
+    Qt5::Core Qt5::Gui Qt5::Widgets
+  )
+  if(WIN32)
+    # GUI 子系统，避免额外弹出控制台窗口。
+    set_target_properties(rc-app PROPERTIES WIN32_EXECUTABLE ON)
+  endif()
+endif()

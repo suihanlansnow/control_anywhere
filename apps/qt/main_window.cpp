@@ -1,6 +1,19 @@
 #include <QApplication>
 #include "main_window.h"
 
+// 同一套 UI 在两平台复用，仅采集后端与默认设备名按平台切换。
+#if defined(_WIN32)
+static constexpr const char* kPlatformHostId = "win-host";
+static constexpr const char* kPlatformClientId = "win-client";
+static constexpr const char* kPlatformCapture = "dxgi";
+static constexpr const char* kPlatformName = "Windows";
+#else
+static constexpr const char* kPlatformHostId = "linux-host";
+static constexpr const char* kPlatformClientId = "linux-client";
+static constexpr const char* kPlatformCapture = "x11";
+static constexpr const char* kPlatformName = "Linux";
+#endif
+
 #include <QAction>
 #include <QMenu>
 #include <QButtonGroup>
@@ -767,11 +780,7 @@ QWidget* MainWindow::buildAboutPanel() {
     vbox->addWidget(makeInfoRow(tr("版本"), mkVal("0.1.0")));
     vbox->addWidget(makeInfoRow(tr("协议"), mkVal("rc-frame v1")));
     vbox->addWidget(makeInfoRow(tr("编码器"), mkVal("H.264 / JPEG")));
-#ifdef __linux__
-    vbox->addWidget(makeInfoRow(tr("平台"), mkVal("Linux")));
-#else
-    vbox->addWidget(makeInfoRow(tr("平台"), mkVal("Windows / Linux")));
-#endif
+    vbox->addWidget(makeInfoRow(tr("平台"), mkVal(kPlatformName)));
     vbox->addWidget(makeInfoRow(tr("构建类型"), mkVal("Release")));
   }
   scroll->addWidget(card1);
@@ -823,12 +832,12 @@ void MainWindow::onStartHost() {
   rc::SessionConfig cfg;
   cfg.relay_host = editRelayHost_ ? editRelayHost_->text().toStdString() : "127.0.0.1";
   cfg.relay_port = spinRelayPort_ ? static_cast<uint16_t>(spinRelayPort_->value()) : 21116;
-  cfg.device_id = editDeviceId_ ? editDeviceId_->text().toStdString() : "linux-host";
+  cfg.device_id = editDeviceId_ ? editDeviceId_->text().toStdString() : kPlatformHostId;
   cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
   cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
   cfg.fps = sliderFps_ ? sliderFps_->value() : 60;
   cfg.quality = sliderQuality_ ? sliderQuality_->value() : 75;
-  cfg.capture = "x11";
+  cfg.capture = kPlatformCapture;
 
   QMetaObject::invokeMethod(worker_, "startHost", Qt::QueuedConnection,
                             Q_ARG(rc::SessionConfig, cfg));
@@ -838,8 +847,8 @@ void MainWindow::onStartClient() {
   rc::SessionConfig cfg;
   cfg.relay_host = editRelayHost_ ? editRelayHost_->text().toStdString() : "127.0.0.1";
   cfg.relay_port = spinRelayPort_ ? static_cast<uint16_t>(spinRelayPort_->value()) : 21116;
-  cfg.device_id = "linux-client";
-  cfg.target_id = editDeviceId_ ? editDeviceId_->text().toStdString() : "linux-host";
+  cfg.device_id = kPlatformClientId;
+  cfg.target_id = editDeviceId_ ? editDeviceId_->text().toStdString() : kPlatformHostId;
   cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
   cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
   cfg.fps = sliderFps_ ? sliderFps_->value() : 60;

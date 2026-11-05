@@ -1,6 +1,9 @@
 #ifdef _WIN32
 // 在这些平台头文件之前定义，避免 windows.h 的 min/max 宏破坏 std::min/std::max。
+// CMake 已全局定义 NOMINMAX，这里加保护防止重复定义告警。
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #define WIN32_LEAN_AND_MEAN
 #endif
 
