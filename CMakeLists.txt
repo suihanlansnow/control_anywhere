@@ -57,6 +57,17 @@ if(UNIX AND NOT APPLE)
     core/codec/ffmpeg_h264_decoder.cpp
     core/render/sdl_renderer.cpp
   )
+
+  pkg_check_modules(PIPEWIRE libpipewire-0.3)
+  pkg_check_modules(GLIB glib-2.0)
+  pkg_check_modules(GIO gio-2.0)
+  if(PIPEWIRE_FOUND AND GLIB_FOUND AND GIO_FOUND)
+    list(APPEND RC_CORE_SOURCES core/capture/pipewire_capture.cpp)
+    set(HAVE_PIPEWIRE_CAPTURE ON)
+    message(STATUS "PipeWire ScreenCast capture enabled")
+  else()
+    message(STATUS "PipeWire deps not found, pipewire capture disabled")
+  endif()
 endif()
 
 add_library(rc_core STATIC ${RC_CORE_SOURCES})
@@ -100,6 +111,15 @@ if(UNIX AND NOT APPLE)
     ${LIBAVFORMAT_LIBRARY_DIRS}
     ${SDL2_LIBRARY_DIRS}
   )
+  if(HAVE_PIPEWIRE_CAPTURE)
+    target_include_directories(rc_core PUBLIC
+      ${PIPEWIRE_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS} ${GIO_INCLUDE_DIRS})
+    target_link_libraries(rc_core PUBLIC
+      ${PIPEWIRE_LIBRARIES} ${GLIB_LIBRARIES} ${GIO_LIBRARIES})
+    target_link_directories(rc_core PUBLIC
+      ${PIPEWIRE_LIBRARY_DIRS} ${GLIB_LIBRARY_DIRS} ${GIO_LIBRARY_DIRS})
+    target_compile_definitions(rc_core PUBLIC HAVE_PIPEWIRE_CAPTURE=1)
+  endif()
 endif()
 
 add_executable(rc-relay server/relay/main.cpp)
