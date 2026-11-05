@@ -35,6 +35,7 @@ if(WIN32)
     core/codec/h264_decoder.cpp
     core/codec/d3d11_video_converter.cpp
     core/codec/color_convert.cpp
+    core/render/window_renderer.cpp
   )
 endif()
 
@@ -53,6 +54,7 @@ if(UNIX AND NOT APPLE)
     core/codec/ffmpeg_jpeg_encoder.cpp
     core/codec/ffmpeg_h264_encoder.cpp
     core/codec/ffmpeg_h264_decoder.cpp
+    core/render/sdl_renderer.cpp
   )
 endif()
 

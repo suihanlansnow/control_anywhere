@@ -119,9 +119,9 @@ bool X11Capture::start(int monitor_index, std::string* error) {
     if (probe) {
       depth_ = probe->depth;
       bits_per_pixel_ = probe->bits_per_pixel;
-      red_mask_ = probe->red_mask;
-      green_mask_ = probe->green_mask;
-      blue_mask_ = probe->blue_mask;
+      red_mask_ = static_cast<uint32_t>(probe->red_mask);
+      green_mask_ = static_cast<uint32_t>(probe->green_mask);
+      blue_mask_ = static_cast<uint32_t>(probe->blue_mask);
       XDestroyImage(probe);
     }
   }
@@ -159,9 +159,9 @@ static bool ximage_to_bgra_fast(XImage* img, CapturedFrame& frame) {
   frame.format = PixelFormat::kBGRA;
   frame.pixels.resize(static_cast<size_t>(w) * h * 4);
 
-  uint32_t rmask = img->red_mask;
-  uint32_t gmask = img->green_mask;
-  uint32_t bmask = img->blue_mask;
+  uint32_t rmask = static_cast<uint32_t>(img->red_mask);
+  uint32_t gmask = static_cast<uint32_t>(img->green_mask);
+  uint32_t bmask = static_cast<uint32_t>(img->blue_mask);
 
   if (img->bits_per_pixel == 32 &&
       rmask == 0x00FF0000 && gmask == 0x0000FF00 && bmask == 0x000000FF) {

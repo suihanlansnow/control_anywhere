@@ -43,6 +43,7 @@ class FFmpegH264Encoder : public IVideoEncoder {
   int height_ = 0;
   int fps_ = 30;
   int quality_ = 75;
+  int crf_ = 23;
   int64_t pts_ = 0;
   bool is_hw_ = false;
   bool opened_ = false;

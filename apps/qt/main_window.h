@@ -16,6 +16,10 @@ class QPushButton;
 class QStackedWidget;
 class QTextEdit;
 class QFrame;
+#include <QCloseEvent>
+#include <QSystemTrayIcon>
+
+class QMenu;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -23,6 +27,9 @@ class MainWindow : public QMainWindow {
  public:
   explicit MainWindow(QWidget* parent = nullptr);
   ~MainWindow() override;
+
+ protected:
+  void closeEvent(QCloseEvent* event) override;
 
  private slots:
   void onNavClicked(int index);
@@ -35,6 +42,7 @@ class MainWindow : public QMainWindow {
   void onProgressUpdated(int frames, qlonglong bytes);
   void onFrameReady(QImage image);
   void onWorkerFinished(int rc);
+  void onTrayActivated(QSystemTrayIcon::ActivationReason reason);
 
  private:
   void buildUI();
@@ -46,12 +54,15 @@ class MainWindow : public QMainWindow {
   QWidget* buildAboutPanel();
   QFrame* makeCard(const QString& title);
   QPushButton* makeNavButton(const QString& text, int iconIndex);
+  void saveSettings();
+  void loadSettings();
+  void initTrayIcon();
 
   QStackedWidget* panels_ = nullptr;
   QLabel* statusText_ = nullptr;
   QTextEdit* logView_ = nullptr;
   // 远程画面显示区（解码后的 BGRA 缩放上屏）。
-  QLabel* videoView_ = nullptr;
+  QWidget* videoView_ = nullptr;
 
   QLineEdit* editPassword_ = nullptr;
   QCheckBox* switchForcePwd_ = nullptr;
@@ -88,4 +99,7 @@ class MainWindow : public QMainWindow {
 
   QThread* workerThread_ = nullptr;
   BackendWorker* worker_ = nullptr;
+
+  QSystemTrayIcon* trayIcon_ = nullptr;
+  QMenu* trayMenu_ = nullptr;
 };

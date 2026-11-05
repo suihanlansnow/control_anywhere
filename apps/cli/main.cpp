@@ -37,6 +37,7 @@
 #include "protocol/protocol.h"
 #include "protocol/video_payload.h"
 #include "session/session.h"
+#include "session/runner.h"
 
 using namespace rc;
 
@@ -582,523 +583,69 @@ int run_selftest() {
   return failures == 0 ? 0 : 1;
 }
 
-int run_host(const Options& opts) {
-  TcpSocket socket = open_relay(opts, "host");
-  if (!socket.valid()) return 2;
 
-  Connection conn(std::move(socket));
-  conn.set_recv_timeout_ms(30000);
-  if (!send_register(conn, opts, "host")) return 2;
-
-  SessionGuard guard;
-  uint64_t session_id = 0;
-  std::vector<uint8_t> nonce;
-  int frames_sent = 0;
-  int input_events = 0;
-  bool running = true;
-
-  while (running) {
-    DecodedFrame frame;
-    if (!conn.recv(frame)) break;
-
-    switch (frame.type) {
-      case MsgType::RegisterAck: {
-        json::Value payload = parse_payload(frame, "host");
-        if (!payload.get("ok") || !payload.get("ok")->as_bool()) {
-          RC_LOGE("host", "register rejected");
-          return 2;
-        }
-        guard.move_to(SessionState::Registered, "host");
-        RC_LOGI("host", "online, waiting for controller");
-        break;
-      }
-      case MsgType::SessionInvite: {
-        session_id = frame.session_id;
-        json::Value payload = parse_payload(frame, "host");
-        std::string from = "unknown";
-        if (const json::Value* from_field = payload.get("from")) {
-          if (const json::Value* id_field = from_field->get("id")) {
-            from = id_field->as_string("unknown");
-          }
-        }
-
-        guard.move_to(SessionState::Invited, "host");
-        json::Value accept = object();
-        accept.set("session_id", static_cast<int64_t>(session_id));
-        conn.send_json(MsgType::SessionAccept, session_id, accept);
-
-        nonce = make_nonce();
-        json::Value challenge = object();
-        challenge.set("session_id", static_cast<int64_t>(session_id));
-        challenge.set("nonce", base64_encode(nonce));
-        challenge.set("method", "password");
-        conn.send_json(MsgType::AuthChallenge, session_id, challenge);
-        guard.move_to(SessionState::Authing, "host");
-        RC_LOGI("host", "session " << session_id << " invited by " << from);
-        break;
-      }
-      case MsgType::AuthResponse: {
-        json::Value payload = parse_payload(frame, "host");
-        const std::string proof =
-            payload.get("password_proof") ? payload.get("password_proof")->as_string() : "";
-        const bool ok = verify_password_proof(opts.password, nonce, proof);
-
-        json::Value result = object();
-        result.set("ok", ok);
-        if (!ok) result.set("reason", "bad password");
-        conn.send_json(MsgType::AuthResult, session_id, result);
-
-        if (!ok) {
-          RC_LOGW("host", "authentication failed");
-          guard.move_to(SessionState::Closing, "host");
-          running = false;
-          break;
-        }
-
-        guard.move_to(SessionState::Ready, "host");
-        guard.move_to(SessionState::Streaming, "host");
-        RC_LOGI("host", "authentication passed, starting capture/encode");
-        frames_sent += stream_frames(conn, opts, session_id);
-        break;
-      }
-      case MsgType::InputMouseMove: {
-        ++input_events;
-        if (frame.payload.size() >= 10) {
-          const uint16_t x = read_u16(frame.payload, 4);
-          const uint16_t y = read_u16(frame.payload, 6);
-          RC_LOGI("host", "input #" << input_events << " move (" << x << "," << y << ")");
-        }
-        break;
-      }
-      case MsgType::InputMouseButton: {
-        ++input_events;
-        if (frame.payload.size() >= 12) {
-          const uint8_t button = frame.payload[4];
-          const uint8_t state = frame.payload[5];
-          const uint16_t x = read_u16(frame.payload, 6);
-          const uint16_t y = read_u16(frame.payload, 8);
-          RC_LOGI("host", "input #" << input_events << " button=" << static_cast<int>(button)
-                                    << " state=" << static_cast<int>(state) << " ("
-                                    << x << "," << y << ")");
-        }
-        break;
-      }
-      case MsgType::SessionClose: {
-        json::Value ack = object();
-        ack.set("reason", "ack");
-        conn.send_json(MsgType::SessionClose, session_id, ack);
-        guard.move_to(SessionState::Closed, "host");
-        RC_LOGI("host", "session closed by controller");
-        running = false;
-        break;
-      }
-      default:
-        break;
-    }
-  }
-
-  RC_LOGI("host", "frames=" << frames_sent << " input_events=" << input_events
-                             << " final_state=" << state_name(guard.state()));
-  return (frames_sent == opts.frames && input_events > 0) ? 0 : 2;
+rc::SessionConfig to_session_config(const Options& opts) {
+  rc::SessionConfig cfg;
+  cfg.relay_host = opts.relay_host;
+  cfg.relay_port = opts.relay_port;
+  cfg.device_id = opts.device_id;
+  cfg.alias = opts.alias;
+  cfg.target_id = opts.target_id;
+  cfg.password = opts.password;
+  cfg.codec = opts.codec;
+  cfg.capture = opts.capture;
+  cfg.fps = opts.fps;
+  cfg.quality = opts.quality;
+  cfg.monitor = opts.monitor;
+  cfg.max_frames = opts.frames;
+  return cfg;
 }
 
-// 跨平台首帧落盘：复用 jpeg 编码器把解码后的画面写成 JPEG。
-// Windows 解码器可能输出 NV12（GPU 直出路径），需先转 BGRA；
-// Linux 解码器固定输出 BGRA，可直接编码。
-void try_dump_first_frame(const Options& opts, DecodedImage& picture,
-                          std::unique_ptr<IVideoEncoder>& dump_encoder,
-                          bool& dumped) {
-  if (opts.dump_frame.empty() || dumped) return;
-
-  if (!dump_encoder) {
-    std::string enc_error;
-    dump_encoder = create_encoder("jpeg", &enc_error);
-    if (dump_encoder &&
-        !dump_encoder->open(picture.width, picture.height, 30, 90, &enc_error)) {
-      RC_LOGW("ctrl", "dump encoder unavailable: " << enc_error);
-      dump_encoder.reset();
+void install_callbacks(rc::HostRunner& runner) {
+  runner.set_log_callback([](const std::string& tag, const std::string& level,
+                              const std::string& msg) {
+    std::printf("[%s] %s %s\n", level.c_str(), tag.c_str(), msg.c_str());
+  });
+  runner.set_status_callback([](const std::string& state) {
+    std::printf("status: %s\n", state.c_str());
+  });
+  runner.set_progress_callback([](int64_t sent, int64_t bytes_total) {
+    if (sent > 0 && sent % 30 == 0) {
+      std::printf("progress: frames=%lld bytes=%lld\n",
+                  (long long)sent, (long long)bytes_total);
     }
-  }
-  if (!dump_encoder) return;
+  });
+}
 
-  std::vector<uint8_t> raw;
-  int raw_stride = picture.stride;
-  if (picture.nv12) {
-#ifdef _WIN32
-    nv12_to_bgra(picture.pixels.data(), picture.width, picture.height,
-                 picture.coded_height, picture.stride, raw);
-    raw_stride = picture.width * 4;
-#else
-    RC_LOGW("ctrl", "nv12 dump not supported on this platform");
-    return;
-#endif
-  } else {
-    raw = std::move(picture.pixels);
-  }
-
-  CapturedFrame source;
-  source.width = picture.width;
-  source.height = picture.height;
-  source.stride = raw_stride;
-  source.capture_ts_us = static_cast<int64_t>(picture.timestamp_us);
-  source.pixels = std::move(raw);
-  EncodedFrame jpeg;
-  std::string dump_error;
-  if (dump_encoder->encode(source, jpeg, &dump_error)) {
-    FILE* file = std::fopen(opts.dump_frame.c_str(), "wb");
-    if (file != nullptr) {
-      std::fwrite(jpeg.data.data(), 1, jpeg.data.size(), file);
-      std::fclose(file);
-      dumped = true;
-      RC_LOGI("ctrl", "dumped first frame -> " << opts.dump_frame << " ("
-                                              << jpeg.data.size() << "B)");
-    } else {
-      RC_LOGW("ctrl", "cannot write " << opts.dump_frame);
+void install_callbacks(rc::ClientRunner& runner) {
+  runner.set_log_callback([](const std::string& tag, const std::string& level,
+                              const std::string& msg) {
+    std::printf("[%s] %s %s\n", level.c_str(), tag.c_str(), msg.c_str());
+  });
+  runner.set_status_callback([](const std::string& state) {
+    std::printf("status: %s\n", state.c_str());
+  });
+  runner.set_progress_callback([](int64_t sent, int64_t bytes_total) {
+    if (sent > 0 && sent % 30 == 0) {
+      std::printf("progress: frames=%lld bytes=%lld\n",
+                  (long long)sent, (long long)bytes_total);
     }
-  } else {
-    RC_LOGW("ctrl", "dump encode failed: " << dump_error);
-  }
+  });
+}
+
+
+int run_host(const Options& opts) {
+  auto cfg = to_session_config(opts);
+  rc::HostRunner runner(cfg);
+  install_callbacks(runner);
+  return runner.run();
 }
 
 int run_connect(const Options& opts) {
-  if (opts.target_id.empty()) {
-    RC_LOGE("ctrl", "target device id is required");
-    return 1;
-  }
-
-  TcpSocket socket = open_relay(opts, "ctrl");
-  if (!socket.valid()) return 2;
-
-  Connection conn(std::move(socket));
-  conn.set_recv_timeout_ms(10000);
-  if (!send_register(conn, opts, "ctrl")) return 2;
-
-  SessionGuard guard;
-  uint64_t session_id = 0;
-  std::vector<uint8_t> nonce;
-  int frames_received = 0;
-  uint64_t bytes_received = 0;
-  uint64_t first_ts = 0;
-  uint64_t last_ts = 0;
-  bool running = true;
-
-#ifdef _WIN32
-  std::unique_ptr<IVideoDecoder> decoder;
-  std::unique_ptr<IRenderer> renderer;
-  std::unique_ptr<IVideoEncoder> dump_encoder;
-  bool dumped = false;
-  bool saw_h264 = false;
-  int frames_decoded = 0;
-  uint64_t total_decode_us = 0;
-#endif
-#ifdef __linux__
-  std::unique_ptr<IVideoDecoder> decoder;
-  std::unique_ptr<IRenderer> renderer;
-  std::unique_ptr<IVideoEncoder> dump_encoder;
-  bool dumped = false;
-  bool saw_h264 = false;
-  int frames_decoded = 0;
-  uint64_t total_decode_us = 0;
-#endif
-
-  // 先等注册回执，再发起连接，保证状态机时序正确。
-  while (true) {
-    DecodedFrame frame;
-    if (!conn.recv(frame)) {
-      RC_LOGE("ctrl", "no register ack from relay");
-      return 2;
-    }
-    if (frame.type == MsgType::RegisterAck) {
-      json::Value payload = parse_payload(frame, "ctrl");
-      if (!payload.get("ok") || !payload.get("ok")->as_bool()) {
-        RC_LOGE("ctrl", "register rejected");
-        return 2;
-      }
-      guard.move_to(SessionState::Registered, "ctrl");
-      break;
-    }
-    if (frame.type == MsgType::Error) {
-      RC_LOGE("ctrl", "relay error while registering");
-      return 2;
-    }
-  }
-
-  json::Value request = object();
-  request.set("target_id", opts.target_id);
-  request.set("mode", "control");
-  json::Value want = object();
-  want.set("codec", opts.codec);
-  want.set("max_fps", opts.fps);
-  want.set("max_width", 0);  // 0 = 由被控端按原生分辨率输出
-  request.set("want", want);
-  conn.send_json(MsgType::ConnectReq, 0, request);
-  guard.move_to(SessionState::Connecting, "ctrl");
-  RC_LOGI("ctrl", "requesting session with " << opts.target_id);
-
-  while (running) {
-    DecodedFrame frame;
-    if (!conn.recv(frame)) {
-      RC_LOGW("ctrl", "connection lost");
-      break;
-    }
-
-    switch (frame.type) {
-      case MsgType::ConnectRsp: {
-        json::Value payload = parse_payload(frame, "ctrl");
-        const json::Value* ok_field = payload.get("ok");
-        if (!ok_field || !ok_field->as_bool()) {
-          const json::Value* reason = payload.get("reason");
-          RC_LOGE("ctrl", "connect rejected: "
-                              << (reason ? reason->as_string("unknown") : "unknown"));
-          return 2;
-        }
-        session_id = frame.session_id;
-        RC_LOGI("ctrl", "session " << session_id << " accepted by host");
-        break;
-      }
-      case MsgType::AuthChallenge: {
-        json::Value payload = parse_payload(frame, "ctrl");
-        const json::Value* nonce_field = payload.get("nonce");
-        if (!nonce_field) {
-          RC_LOGE("ctrl", "challenge without nonce");
-          return 2;
-        }
-        nonce = base64_decode(nonce_field->as_string());
-        guard.move_to(SessionState::Authing, "ctrl");
-
-        json::Value response = object();
-        response.set("password_proof", password_proof(opts.password, nonce));
-        conn.send_json(MsgType::AuthResponse, session_id, response);
-        RC_LOGI("ctrl", "password proof sent");
-        break;
-      }
-      case MsgType::AuthResult: {
-        json::Value payload = parse_payload(frame, "ctrl");
-        const json::Value* ok_field = payload.get("ok");
-        if (!ok_field || !ok_field->as_bool()) {
-          RC_LOGE("ctrl", "authentication rejected");
-          return 2;
-        }
-        guard.move_to(SessionState::Ready, "ctrl");
-        guard.move_to(SessionState::Streaming, "ctrl");
-        RC_LOGI("ctrl", "authenticated, sending input events");
-
-        const std::vector<uint8_t> move = make_mouse_move(32000, 24000, 0);
-        conn.send(MsgType::InputMouseMove, session_id, move.data(), move.size());
-
-        const std::vector<uint8_t> down = make_mouse_button(1, 1, 32000, 24000);
-        conn.send(MsgType::InputMouseButton, session_id, down.data(), down.size());
-
-        const std::vector<uint8_t> up = make_mouse_button(1, 0, 32000, 24000);
-        conn.send(MsgType::InputMouseButton, session_id, up.data(), up.size());
-        RC_LOGI("ctrl", "input events sent");
-        break;
-      }
-      case MsgType::VideoFrame: {
-        VideoFrameMeta meta;
-        if (!parse_video_payload(frame.payload, meta)) {
-          RC_LOGW("ctrl", "malformed video frame");
-          break;
-        }
-        ++frames_received;
-        bytes_received += meta.data_len;
-        if (first_ts == 0) first_ts = meta.capture_ts_us;
-        last_ts = meta.capture_ts_us;
-
-        bool format_ok = true;
-        if (meta.codec == static_cast<uint8_t>(VideoCodec::Jpeg) && meta.data_len >= 2) {
-          const uint8_t* data = frame.payload.data() + kVideoHeaderBytes;
-          format_ok = data[0] == 0xFF && data[1] == 0xD8;
-        }
-
-        if (meta.keyframe || frames_received % 20 == 0) {
-          RC_LOGI("ctrl", "video #" << meta.frame_id << " " << meta.width << "x"
-                                    << meta.height << " "
-                                    << codec_name(static_cast<VideoCodec>(meta.codec)) << " "
-                                    << meta.data_len << "B"
-                                    << " encode=" << (meta.encode_ts_us - meta.capture_ts_us)
-                                    << "us"
-                                    << (meta.keyframe ? " [key]" : "")
-                                    << (format_ok ? "" : " [bad jpeg marker]"));
-        }
-
-#ifdef _WIN32
-        if (meta.codec == static_cast<uint8_t>(VideoCodec::H264)) {
-          saw_h264 = true;
-
-          // 窗口消息必须在创建它的线程里泵，否则拖拽/关闭都不响应。
-          if (renderer) {
-            renderer->pump();
-            if (!renderer->alive()) {
-              RC_LOGW("ctrl", "window closed by user, stop rendering");
-              renderer.reset();
-            }
-          }
-
-          // 窗口必须在解码前建立：解码输出格式取决于窗口能否走 GPU 直出。
-          if (opts.render && !renderer) {
-            renderer = std::make_unique<WindowRenderer>();
-            std::string render_error;
-            if (!renderer->open("rc remote - " + opts.target_id,
-                                static_cast<int>(meta.width),
-                                static_cast<int>(meta.height), &render_error)) {
-              RC_LOGE("ctrl", "window open failed: " << render_error);
-              renderer.reset();
-            }
-          }
-
-          if (!decoder) {
-            decoder = create_decoder(nullptr);
-            // swapchain 就绪时让解码器直接出 NV12，由 VideoProcessor 画进 back buffer，
-            // 省掉回读 8MB BGRA 与 GDI 拷贝。
-            if (renderer && renderer->gpu()) {
-              decoder->set_output(IVideoDecoder::Output::kNv12);
-            }
-            std::string decode_error;
-            if (!decoder->open(&decode_error)) {
-              RC_LOGE("ctrl", "h264 decoder open failed: " << decode_error);
-              decoder.reset();
-            } else {
-              RC_LOGI("ctrl", "decoder=" << decoder->name());
-            }
-          }
-
-          if (decoder) {
-            DecodedImage picture;
-            std::string decode_error;
-            const uint64_t begin_us = now_us();
-            const uint8_t* data = frame.payload.data() + kVideoHeaderBytes;
-            if (decoder->decode(data, meta.data_len,
-                                static_cast<int64_t>(meta.capture_ts_us), picture,
-                                &decode_error)) {
-              ++frames_decoded;
-              total_decode_us += now_us() - begin_us;
-
-              if (renderer) {
-                if (picture.nv12) {
-                  renderer->present_nv12(picture.pixels.data(), picture.width,
-                                         picture.height, picture.coded_height,
-                                         picture.stride);
-                } else {
-                  renderer->present(picture.pixels.data(), picture.width,
-                                    picture.height, picture.stride);
-                }
-              }
-
-              // 首帧落盘，方便在无人值守的联调环境里直接验证解码画面。
-              try_dump_first_frame(opts, picture, dump_encoder, dumped);
-            } else if (!decode_error.empty() && frames_received <= 3) {
-              RC_LOGW("ctrl", "decode failed: " << decode_error);
-            }
-          }
-        }
-#elif defined(__linux__)
-        if (meta.codec == static_cast<uint8_t>(VideoCodec::H264)) {
-          saw_h264 = true;
-
-          if (renderer) {
-            renderer->pump();
-            if (!renderer->alive()) {
-              RC_LOGW("ctrl", "window closed by user, stop rendering");
-              renderer.reset();
-            }
-          }
-
-          if (opts.render && !renderer) {
-            renderer = std::make_unique<SdlRenderer>();
-            std::string render_error;
-            if (!renderer->open("rc remote - " + opts.target_id,
-                                static_cast<int>(meta.width),
-                                static_cast<int>(meta.height), &render_error)) {
-              RC_LOGE("ctrl", "sdl window open failed: " << render_error);
-              renderer.reset();
-            }
-          }
-
-          if (!decoder) {
-            decoder = create_decoder(nullptr);
-            decoder->set_output(IVideoDecoder::Output::kBgra);
-            std::string decode_error;
-            if (!decoder->open(&decode_error)) {
-              RC_LOGE("ctrl", "h264 decoder open failed: " << decode_error);
-              decoder.reset();
-            } else {
-              RC_LOGI("ctrl", "decoder=" << decoder->name());
-            }
-          }
-
-          if (decoder) {
-            DecodedImage picture;
-            std::string decode_error;
-            const uint64_t begin_us = now_us();
-            const uint8_t* data = frame.payload.data() + kVideoHeaderBytes;
-            if (decoder->decode(data, meta.data_len,
-                                static_cast<int64_t>(meta.capture_ts_us), picture,
-                                &decode_error)) {
-              ++frames_decoded;
-              total_decode_us += now_us() - begin_us;
-
-              if (renderer && !picture.nv12) {
-                renderer->present(picture.pixels.data(), picture.width,
-                                  picture.height, picture.stride);
-              }
-
-              // 首帧落盘，方便在无人值守的联调环境里直接验证解码画面。
-              try_dump_first_frame(opts, picture, dump_encoder, dumped);
-            } else if (!decode_error.empty() && frames_received <= 3) {
-              RC_LOGW("ctrl", "decode failed: " << decode_error);
-            }
-          }
-        }
-#endif
-
-        if (frames_received >= opts.frames) {
-          json::Value close_payload = object();
-          close_payload.set("reason", "m1 test done");
-          conn.send_json(MsgType::SessionClose, session_id, close_payload);
-          guard.move_to(SessionState::Closing, "ctrl");
-          running = false;
-        }
-        break;
-      }
-      case MsgType::SessionClose:
-        RC_LOGI("ctrl", "session closed by host");
-        guard.move_to(SessionState::Closed, "ctrl");
-        running = false;
-        break;
-      case MsgType::Error: {
-        json::Value payload = parse_payload(frame, "ctrl");
-        RC_LOGE("ctrl", "relay error: "
-                            << (payload.get("message") ? payload.get("message")->as_string()
-                                                       : "unknown"));
-        return 2;
-      }
-      default:
-        break;
-    }
-  }
-
-  RC_LOGI("ctrl", "frames=" << frames_received << " final_state="
-                             << state_name(guard.state()));
-#if defined(_WIN32) || defined(__linux__)
-  if (decoder) {
-    RC_LOGI("ctrl", "decoded=" << frames_decoded << " avg_decode="
-                               << (frames_decoded > 0 ? total_decode_us / frames_decoded : 0)
-                               << "us");
-  }
-#endif
-  if (frames_received > 0 && last_ts > first_ts) {
-    const double seconds = (last_ts - first_ts) / 1e6;
-    RC_LOGI("ctrl", "received " << bytes_received << "B in " << static_cast<int>(seconds * 1000)
-                                << "ms, fps=" << static_cast<int>(frames_received / seconds)
-                                << " kbps=" << static_cast<int>(bytes_received * 8 / seconds / 1000));
-  }
-
-  bool decoded_ok = true;
-#if defined(_WIN32) || defined(__linux__)
-  if (saw_h264) decoded_ok = frames_decoded > 0;
-#endif
-  return (frames_received >= opts.frames && decoded_ok) ? 0 : 2;
+  auto cfg = to_session_config(opts);
+  rc::ClientRunner runner(cfg);
+  install_callbacks(runner);
+  return runner.run();
 }
 
 }  // namespace

@@ -20,6 +20,12 @@ static const HwCodecProfile kHwProfiles[] = {
 
 namespace {
 
+inline int quality_to_crf(int q) {
+  if (q <= 0) q = 75;
+  if (q > 100) q = 100;
+  return 18 + (100 - q) * 22 / 100;
+}
+
 // 硬件编码器优先级由用户运行时指定：环境变量 RC_H264_ENCODER=auto|nvenc|qsv|soft。
 // auto 保持 nvenc > qsv > libx264 的原顺序；显式指定时只尝试该后端，
 // 打不开就回退软编，同时把实际选用结果打到日志，便于现场确认。
@@ -51,7 +57,8 @@ bool FFmpegH264Encoder::open(int width, int height, int fps, int quality,
   width_ = width;
   height_ = height;
   fps_ = fps > 0 ? fps : 30;
-  quality_ = quality > 0 ? quality : 23;
+  quality_ = quality > 0 ? quality : 75;
+  crf_ = quality_to_crf(quality_);
 
   const EncoderPreference preference = read_encoder_preference();
 
@@ -77,9 +84,15 @@ bool FFmpegH264Encoder::open(int width, int height, int fps, int quality,
       av_dict_set(&opts, "preset", "p4", 0);
       av_dict_set(&opts, "tune", "ll", 0);
       av_dict_set(&opts, "rc", "vbr", 0);
+      char cqp[16];
+      std::snprintf(cqp, sizeof(cqp), "%d", crf_);
+      av_dict_set(&opts, "cqp", cqp, 0);
     } else if (!std::strcmp(p->name, "h264_qsv")) {
       av_dict_set(&opts, "preset", "medium", 0);
-      av_dict_set(&opts, "rate_control", "CBR", 0);
+      av_dict_set(&opts, "rate_control", "CQP", 0);
+      char cqp[16];
+      std::snprintf(cqp, sizeof(cqp), "%d %d %d", crf_, crf_, crf_);
+      av_dict_set(&opts, "qp", cqp, 0);
     }
 
     if (avcodec_open2(ctx_, codec_, &opts) == 0) {
@@ -118,7 +131,7 @@ bool FFmpegH264Encoder::open(int width, int height, int fps, int quality,
   av_dict_set(&opts, "preset", "veryfast", 0);
   av_dict_set(&opts, "tune", "zerolatency", 0);
   char crf[16];
-  std::snprintf(crf, sizeof(crf), "%d", quality_);
+  std::snprintf(crf, sizeof(crf), "%d", crf_);
   av_dict_set(&opts, "crf", crf, 0);
   av_dict_set(&opts, "profile", "baseline", 0);
 

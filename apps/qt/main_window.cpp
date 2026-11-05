@@ -1,16 +1,22 @@
+#include <QApplication>
 #include "main_window.h"
 
+#include <QAction>
+#include <QMenu>
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QPainter>
 #include <QPixmap>
 #include <QPushButton>
+#include <QSettings>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
@@ -18,6 +24,51 @@
 #include <QTextEdit>
 #include <QVBoxLayout>
 #include <QWidget>
+
+namespace {
+
+class VideoWidget : public QWidget {
+ public:
+  explicit VideoWidget(QWidget* parent = nullptr) : QWidget(parent) {
+    setMinimumHeight(320);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    setStyleSheet("background-color:#101014; color:#8a8f98; border-radius:6px;");
+  }
+
+  void setFrame(const QImage& image) {
+    frame_ = image;
+    update();
+  }
+
+  void setPlaceholder(const QString& text) {
+    placeholder_ = text;
+    update();
+  }
+
+ protected:
+  void paintEvent(QPaintEvent*) override {
+    QPainter p(this);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    p.fillRect(rect(), QColor("#101014"));
+
+    if (frame_.isNull()) {
+      p.setPen(QColor("#8a8f98"));
+      p.drawText(rect(), Qt::AlignCenter, placeholder_);
+      return;
+    }
+
+    const QSize s = frame_.size().scaled(rect().size(), Qt::KeepAspectRatio);
+    const int x = (width() - s.width()) / 2;
+    const int y = (height() - s.height()) / 2;
+    p.drawImage(QRect(x, y, s.width(), s.height()), frame_);
+  }
+
+ private:
+  QImage frame_;
+  QString placeholder_{tr("等待远程画面…")};
+};
+
+}  // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   setWindowTitle(tr("远程控制 · 设置"));
@@ -37,13 +88,27 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   connect(worker_, &BackendWorker::finished, this, &MainWindow::onWorkerFinished);
 
   workerThread_->start();
+
+  loadSettings();
+  initTrayIcon();
 }
 
 MainWindow::~MainWindow() {
+  saveSettings();
   if (workerThread_) {
     worker_->stop();
     workerThread_->quit();
     workerThread_->wait(2000);
+  }
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+  saveSettings();
+  if (trayIcon_ && trayIcon_->isVisible()) {
+    hide();
+    event->ignore();
+  } else {
+    event->accept();
   }
 }
 
@@ -147,7 +212,7 @@ QWidget* MainWindow::buildSidebar() {
   footerLayout->addStretch();
   layout->addWidget(footer);
 
-  connect(group, QOverload<int>::of(&QButtonGroup::buttonClicked), this, &MainWindow::onNavClicked);
+  connect(group, &QButtonGroup::idClicked, this, &MainWindow::onNavClicked);
   static_cast<QPushButton*>(group->button(0))->setChecked(true);
 
   return sidebar;
@@ -298,12 +363,7 @@ QWidget* MainWindow::buildDisplayPanel() {
   cardVideo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
   {
     auto* vbox = static_cast<QVBoxLayout*>(cardVideo->layout());
-    videoView_ = new QLabel(tr("等待远程画面…"));
-    videoView_->setAlignment(Qt::AlignCenter);
-    videoView_->setMinimumHeight(320);
-    videoView_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    videoView_->setStyleSheet(
-        "background-color:#101014; color:#8a8f98; border-radius:6px;");
+    videoView_ = new VideoWidget();
     vbox->addWidget(videoView_, 1);
   }
   scroll->addWidget(cardVideo, 1);
@@ -755,7 +815,8 @@ QWidget* MainWindow::buildAboutPanel() {
 }
 
 void MainWindow::onSaveSettings() {
-  if (logView_) logView_->append("设置已保存");
+  saveSettings();
+  if (logView_) logView_->append(tr("设置已保存"));
 }
 
 void MainWindow::onStartHost() {
@@ -837,13 +898,116 @@ void MainWindow::onProgressUpdated(int frames, qlonglong bytes) {
 
 void MainWindow::onFrameReady(QImage image) {
   if (!videoView_ || image.isNull()) return;
-  // 按控件大小等比缩放；每帧平滑缩放太贵，用快速变换。
-  const QPixmap pix = QPixmap::fromImage(image).scaled(
-      videoView_->size(), Qt::KeepAspectRatio, Qt::FastTransformation);
-  videoView_->setPixmap(pix);
+  static_cast<VideoWidget*>(videoView_)->setFrame(image);
 }
 
 void MainWindow::onWorkerFinished(int rc) {
   Q_UNUSED(rc);
   if (statusText_) statusText_->setText(tr("已停止"));
+}
+
+void MainWindow::saveSettings() {
+  QSettings s;
+  s.setValue("relay/host", editRelayHost_ ? editRelayHost_->text() : "");
+  s.setValue("relay/port", spinRelayPort_ ? spinRelayPort_->value() : 21116);
+  s.setValue("device/id", editDeviceId_ ? editDeviceId_->text() : "");
+  s.setValue("security/password", editPassword_ ? editPassword_->text() : "");
+  s.setValue("security/force_pwd", switchForcePwd_ ? switchForcePwd_->isChecked() : false);
+  s.setValue("security/aes", switchAes_ ? switchAes_->isChecked() : true);
+  s.setValue("security/cert_verify", switchCertVerify_ ? switchCertVerify_->isChecked() : true);
+  if (comboCodec_) s.setValue("display/codec", comboCodec_->currentData().toString());
+  s.setValue("display/fps", sliderFps_ ? sliderFps_->value() : 60);
+  s.setValue("display/quality", sliderQuality_ ? sliderQuality_->value() : 75);
+  if (comboResolution_) s.setValue("display/resolution", comboResolution_->currentIndex());
+  s.setValue("display/auto_bitrate", switchAutoBitrate_ ? switchAutoBitrate_->isChecked() : false);
+  s.setValue("network/timeout", sliderTimeout_ ? sliderTimeout_->value() : 30);
+  s.setValue("network/auto_reconnect", switchAutoReconnect_ ? switchAutoReconnect_->isChecked() : true);
+  s.setValue("network/tcp_no_delay", switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true);
+  s.setValue("perm/keyboard", switchKeyboard_ ? switchKeyboard_->isChecked() : true);
+  s.setValue("perm/mouse", switchMouse_ ? switchMouse_->isChecked() : true);
+  s.setValue("perm/clipboard", switchClipboard_ ? switchClipboard_->isChecked() : false);
+  s.setValue("perm/file_transfer", switchFileTransfer_ ? switchFileTransfer_->isChecked() : false);
+  s.setValue("perm/audio", switchAudio_ ? switchAudio_->isChecked() : false);
+  s.setValue("perm/multi_monitor", switchMultiMonitor_ ? switchMultiMonitor_->isChecked() : true);
+}
+
+void MainWindow::loadSettings() {
+  QSettings s;
+  if (editRelayHost_) editRelayHost_->setText(s.value("relay/host", "127.0.0.1").toString());
+  if (spinRelayPort_) spinRelayPort_->setValue(s.value("relay/port", 21116).toInt());
+  if (editDeviceId_) editDeviceId_->setText(s.value("device/id", "").toString());
+  if (editPassword_) editPassword_->setText(s.value("security/password", "").toString());
+  if (switchForcePwd_) switchForcePwd_->setChecked(s.value("security/force_pwd", false).toBool());
+  if (switchAes_) switchAes_->setChecked(s.value("security/aes", true).toBool());
+  if (switchCertVerify_) switchCertVerify_->setChecked(s.value("security/cert_verify", true).toBool());
+  if (comboCodec_) {
+    const QString codec = s.value("display/codec", "h264").toString();
+    const int idx = comboCodec_->findData(codec);
+    if (idx >= 0) comboCodec_->setCurrentIndex(idx);
+  }
+  if (sliderFps_) sliderFps_->setValue(s.value("display/fps", 60).toInt());
+  if (sliderQuality_) sliderQuality_->setValue(s.value("display/quality", 75).toInt());
+  if (comboResolution_) comboResolution_->setCurrentIndex(s.value("display/resolution", 0).toInt());
+  if (switchAutoBitrate_) switchAutoBitrate_->setChecked(s.value("display/auto_bitrate", false).toBool());
+  if (sliderTimeout_) sliderTimeout_->setValue(s.value("network/timeout", 30).toInt());
+  if (switchAutoReconnect_) switchAutoReconnect_->setChecked(s.value("network/auto_reconnect", true).toBool());
+  if (switchTcpNoDelay_) switchTcpNoDelay_->setChecked(s.value("network/tcp_no_delay", true).toBool());
+  if (switchKeyboard_) switchKeyboard_->setChecked(s.value("perm/keyboard", true).toBool());
+  if (switchMouse_) switchMouse_->setChecked(s.value("perm/mouse", true).toBool());
+  if (switchClipboard_) switchClipboard_->setChecked(s.value("perm/clipboard", false).toBool());
+  if (switchFileTransfer_) switchFileTransfer_->setChecked(s.value("perm/file_transfer", false).toBool());
+  if (switchAudio_) switchAudio_->setChecked(s.value("perm/audio", false).toBool());
+  if (switchMultiMonitor_) switchMultiMonitor_->setChecked(s.value("perm/multi_monitor", true).toBool());
+}
+
+void MainWindow::initTrayIcon() {
+  if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+    RC_LOGW("ui", "system tray not available, skip tray icon");
+    return;
+  }
+
+  QIcon icon = style()->standardIcon(QStyle::SP_ComputerIcon);
+
+  trayMenu_ = new QMenu(this);
+  QAction* actShow = trayMenu_->addAction(tr("显示主窗口"));
+  trayMenu_->addSeparator();
+  QAction* actHost = trayMenu_->addAction(tr("启动被控端"));
+  QAction* actClient = trayMenu_->addAction(tr("启动主控端"));
+  QAction* actStop = trayMenu_->addAction(tr("停止"));
+  trayMenu_->addSeparator();
+  QAction* actQuit = trayMenu_->addAction(tr("退出"));
+
+  trayIcon_ = new QSystemTrayIcon(icon, this);
+  trayIcon_->setContextMenu(trayMenu_);
+  trayIcon_->setToolTip(tr("远程控制 PC"));
+  trayIcon_->show();
+
+  connect(trayIcon_, &QSystemTrayIcon::activated,
+          this, &MainWindow::onTrayActivated);
+  connect(actShow, &QAction::triggered, this, [this]() {
+    showNormal();
+    activateWindow();
+    raise();
+  });
+  connect(actHost, &QAction::triggered, this, &MainWindow::onStartHost);
+  connect(actClient, &QAction::triggered, this, &MainWindow::onStartClient);
+  connect(actStop, &QAction::triggered, this, &MainWindow::onStop);
+  connect(actQuit, &QAction::triggered, this, [this]() {
+    saveSettings();
+    if (worker_) worker_->stop();
+    qApp->quit();
+  });
+}
+
+void MainWindow::onTrayActivated(QSystemTrayIcon::ActivationReason reason) {
+  if (reason == QSystemTrayIcon::DoubleClick ||
+      reason == QSystemTrayIcon::Trigger) {
+    if (isVisible()) {
+      hide();
+    } else {
+      showNormal();
+      activateWindow();
+      raise();
+    }
+  }
 }

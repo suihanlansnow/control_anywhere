@@ -16,6 +16,12 @@
 #include "net/connection.h"
 #include "net/socket.h"
 #include "protocol/video_payload.h"
+#include "render/renderer.h"
+#ifdef __linux__
+#include "render/sdl_renderer.h"
+#else
+#include "render/window_renderer.h"
+#endif
 
 namespace rc {
 
@@ -333,7 +339,6 @@ int HostRunner::run() {
   SessionGuard guard;
   uint64_t session_id = 0;
   std::vector<uint8_t> nonce;
-  int frames_sent = 0;
 
   while (!stop_flag_.load()) {
     DecodedFrame frame;
@@ -396,7 +401,7 @@ int HostRunner::run() {
         guard.move_to(SessionState::Ready);
         guard.move_to(SessionState::Streaming);
         log_("INFO", "host", "authentication passed, starting capture/encode");
-        frames_sent = stream_frames_(conn, session_id);
+        stream_frames_(conn, session_id);
         break;
       }
       case MsgType::SessionClose: {
@@ -490,6 +495,32 @@ int ClientRunner::run() {
 
   // 第 4 点：解码放到独立线程，收包线程不再被解码耗时阻塞；
   // 队列深度 1，解码跟不上时覆盖旧帧而不是排队累积延迟。
+  std::unique_ptr<IRenderer> renderer;
+  struct RenderFrame {
+    std::vector<uint8_t> bgra;
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+  };
+  std::mutex render_mutex;
+  RenderFrame render_frame;
+  bool render_has_frame = false;
+
+  if (cfg_.render && !frame_cb_) {
+#ifdef __linux__
+    renderer = std::make_unique<SdlRenderer>();
+#else
+    renderer = std::make_unique<WindowRenderer>();
+#endif
+    std::string render_err;
+    if (!renderer->open("rc ctrl", 1280, 720, &render_err)) {
+      log_("WARN", "ctrl", "renderer open failed: " + render_err + ", fallback no-render");
+      renderer.reset();
+    } else {
+      log_("INFO", "ctrl", "renderer=" + std::string(renderer->name()));
+    }
+  }
+
   std::mutex decode_mutex;
   std::condition_variable decode_cv;
   std::vector<uint8_t> decode_payload;
@@ -542,6 +573,17 @@ int ClientRunner::run() {
         // 交给上层显示（GUI 在这里做深拷贝再跨线程投递）。
         if (frame_cb_ && !picture.pixels.empty() && !picture.nv12 && picture.stride > 0) {
           frame_cb_(picture.pixels.data(), picture.width, picture.height, picture.stride);
+        } else if (renderer && !picture.pixels.empty() && !picture.nv12 && picture.stride > 0) {
+          RenderFrame rf;
+          rf.bgra = picture.pixels;
+          rf.width = picture.width;
+          rf.height = picture.height;
+          rf.stride = picture.stride;
+          {
+            std::lock_guard<std::mutex> lk(render_mutex);
+            render_frame = std::move(rf);
+            render_has_frame = true;
+          }
         }
       }
     }
@@ -584,6 +626,27 @@ int ClientRunner::run() {
   } hb_joiner{&hb_stop, &hb_thread};
 
   while (!stop_flag_.load()) {
+    if (renderer) {
+      renderer->pump();
+      if (!renderer->alive()) {
+        log_("INFO", "ctrl", "renderer window closed by user");
+        break;
+      }
+      RenderFrame rf;
+      bool has_frame = false;
+      {
+        std::lock_guard<std::mutex> lk(render_mutex);
+        if (render_has_frame) {
+          rf = std::move(render_frame);
+          render_has_frame = false;
+          has_frame = true;
+        }
+      }
+      if (has_frame) {
+        renderer->present(rf.bgra.data(), rf.width, rf.height, rf.stride);
+      }
+    }
+
     DecodedFrame frame;
     if (!conn.recv(frame)) break;
 

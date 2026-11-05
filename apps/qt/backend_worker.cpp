@@ -47,14 +47,17 @@ void BackendWorker::startClient(const rc::SessionConfig& cfg) {
                               Q_ARG(qlonglong, static_cast<qlonglong>(bytes)));
   });
   client_->set_frame_callback([this](const uint8_t* bgra, int width, int height, int stride) {
-    // 后台线程里做一次深拷贝：QImage 隐式共享，按值跨线程投递是安全的。
     QImage image(width, height, QImage::Format_ARGB32);
     if (image.isNull()) return;
-    const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
-    for (int y = 0; y < height; ++y) {
-      std::memcpy(image.scanLine(y),
-                  bgra + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride),
-                  row_bytes);
+    const std::size_t w4 = static_cast<std::size_t>(width) * 4;
+    if (stride == static_cast<int>(w4)) {
+      std::memcpy(image.bits(), bgra, w4 * static_cast<std::size_t>(height));
+    } else {
+      for (int y = 0; y < height; ++y) {
+        std::memcpy(image.scanLine(y),
+                    bgra + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride),
+                    w4);
+      }
     }
     emit frameReady(image);
   });
