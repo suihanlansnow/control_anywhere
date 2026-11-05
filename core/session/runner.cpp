@@ -488,9 +488,100 @@ int ClientRunner::run() {
   guard.move_to(SessionState::Connecting);
   log_("INFO", "ctrl", "requesting session with " + cfg_.target_id);
 
-  std::unique_ptr<IVideoDecoder> decoder;
-  int frames_decoded = 0;
-  uint64_t total_decode_us = 0;
+  // 第 4 点：解码放到独立线程，收包线程不再被解码耗时阻塞；
+  // 队列深度 1，解码跟不上时覆盖旧帧而不是排队累积延迟。
+  std::mutex decode_mutex;
+  std::condition_variable decode_cv;
+  std::vector<uint8_t> decode_payload;
+  VideoFrameMeta decode_meta;
+  bool decode_has_frame = false;
+  std::atomic<bool> decode_stop{false};
+  std::atomic<int> frames_decoded{0};
+  std::atomic<uint64_t> total_decode_us{0};
+
+  std::thread decode_thread([&]() {
+    std::unique_ptr<IVideoDecoder> decoder;
+    DecodedImage picture;
+    while (true) {
+      std::vector<uint8_t> payload;
+      VideoFrameMeta meta;
+      {
+        std::unique_lock<std::mutex> lock(decode_mutex);
+        decode_cv.wait(lock, [&] { return decode_has_frame || decode_stop.load(); });
+        if (decode_stop.load() && !decode_has_frame) break;
+        payload = std::move(decode_payload);
+        meta = decode_meta;
+        decode_has_frame = false;
+      }
+
+      const std::size_t data_len = payload.size() >= kVideoHeaderBytes
+          ? payload.size() - kVideoHeaderBytes : 0;
+      if (data_len == 0) continue;
+      const uint8_t* data = payload.data() + kVideoHeaderBytes;
+
+      if (!decoder) {
+        std::string dec_error;
+        decoder = create_decoder(&dec_error);
+        if (!decoder) {
+          log_("WARN", "ctrl", "decoder create failed: " + dec_error);
+          continue;
+        }
+        decoder->set_output(IVideoDecoder::Output::kBgra);
+        if (!decoder->open(&dec_error)) {
+          log_("WARN", "ctrl", "decoder open failed: " + dec_error);
+          decoder.reset();
+        }
+      }
+      if (!decoder) continue;
+
+      std::string dec_error;
+      const uint64_t t0 = now_us();
+      if (decoder->decode(data, data_len, meta.capture_ts_us, picture, &dec_error)) {
+        total_decode_us.fetch_add(now_us() - t0);
+        frames_decoded.fetch_add(1);
+        // 交给上层显示（GUI 在这里做深拷贝再跨线程投递）。
+        if (frame_cb_ && !picture.pixels.empty() && !picture.nv12 && picture.stride > 0) {
+          frame_cb_(picture.pixels.data(), picture.width, picture.height, picture.stride);
+        }
+      }
+    }
+  });
+
+  // 第 1 点残余：主控端空闲时定期发心跳，避免被控端 30s 收不到输入事件而结束会话。
+  std::atomic<bool> hb_stop{false};
+  std::atomic<uint64_t> hb_session{0};
+  std::thread hb_thread([&]() {
+    while (!hb_stop.load()) {
+      for (int i = 0; i < 20 && !hb_stop.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+      if (hb_stop.load()) break;
+      const uint64_t sid = hb_session.load();
+      if (sid == 0) continue;
+      if (!conn.send(MsgType::Heartbeat, sid, nullptr, 0)) break;
+    }
+  });
+
+  // 任何 return 路径都必须先停线程再 join，否则 std::thread 析构会 terminate。
+  struct DecodeJoiner {
+    std::atomic<bool>* stop;
+    std::condition_variable* cv;
+    std::thread* thread;
+    ~DecodeJoiner() {
+      stop->store(true);
+      cv->notify_all();
+      if (thread->joinable()) thread->join();
+    }
+  } decode_joiner{&decode_stop, &decode_cv, &decode_thread};
+
+  struct HeartbeatJoiner {
+    std::atomic<bool>* stop;
+    std::thread* thread;
+    ~HeartbeatJoiner() {
+      stop->store(true);
+      if (thread->joinable()) thread->join();
+    }
+  } hb_joiner{&hb_stop, &hb_thread};
 
   while (!stop_flag_.load()) {
     DecodedFrame frame;
@@ -507,6 +598,7 @@ int ClientRunner::run() {
           return 2;
         }
         session_id = frame.session_id;
+        hb_session.store(session_id);
         guard.move_to(SessionState::Ready);
         log_("INFO", "ctrl", "session " + std::to_string(session_id) + " accepted by host");
         break;
@@ -543,34 +635,17 @@ int ClientRunner::run() {
         VideoFrameMeta meta;
         if (!parse_video_payload(frame.payload, meta)) break;
 
-        if (!decoder) {
-          std::string dec_error;
-          decoder = create_decoder(&dec_error);
-          if (decoder) {
-            // B5: 客户端解码器固定输出 BGRA，供后续渲染/落盘。
-            decoder->set_output(IVideoDecoder::Output::kBgra);
-            decoder->open(&dec_error);
-          }
+        const std::size_t payload_size = frame.payload.size();
+        {
+          std::lock_guard<std::mutex> lock(decode_mutex);
+          decode_payload = std::move(frame.payload);  // 深度 1：解码慢时覆盖旧帧
+          decode_meta = meta;
+          decode_has_frame = true;
         }
-        DecodedImage picture;
-        std::string dec_error;
-        auto t0 = now_us();
-        if (decoder) {
-          std::size_t data_len = frame.payload.size() >= kVideoHeaderBytes
-              ? frame.payload.size() - kVideoHeaderBytes : 0;
-          const uint8_t* data = data_len > 0 ? frame.payload.data() + kVideoHeaderBytes : nullptr;
-          if (data && decoder->decode(data, data_len, meta.capture_ts_us, picture, &dec_error)) {
-            total_decode_us += now_us() - t0;
-            ++frames_decoded;
-            // 交给上层显示（GUI 会在这里做一次深拷贝再跨线程投递）。
-            if (frame_cb_ && !picture.pixels.empty() && !picture.nv12 && picture.stride > 0) {
-              frame_cb_(picture.pixels.data(), picture.width, picture.height, picture.stride);
-            }
-          }
-        }
+        decode_cv.notify_one();
 
         ++frames_received;
-        bytes_received += frame.payload.size();
+        bytes_received += payload_size;
         if (progress_cb_) {
           progress_cb_(frames_received, static_cast<int64_t>(bytes_received));
         }
@@ -595,9 +670,12 @@ int ClientRunner::run() {
     }
   }
 
-  if (frames_decoded > 0) {
-    log_("INFO", "ctrl", "frames_decoded=" + std::to_string(frames_decoded) +
-                           " avg_decode=" + std::to_string(total_decode_us / frames_decoded) + "us");
+  const int decoded = frames_decoded.load();
+  if (decoded > 0) {
+    log_("INFO", "ctrl", "frames_decoded=" + std::to_string(decoded) +
+                           " avg_decode=" +
+                           std::to_string(total_decode_us.load() / static_cast<uint64_t>(decoded)) +
+                           "us");
   }
   return 0;
 }
