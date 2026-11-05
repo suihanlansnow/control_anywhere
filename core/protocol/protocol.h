@@ -22,6 +22,8 @@ enum class MsgType : uint8_t {
   ConnectRsp = 0x06,
   Ping = 0x08,
   Pong = 0x09,
+  // 被控端空闲（画面静止、采集无更新）时的心跳，防止主控端读超时误判断线。
+  Heartbeat = 0x0A,
 
   SessionInvite = 0x10,
   SessionAccept = 0x11,

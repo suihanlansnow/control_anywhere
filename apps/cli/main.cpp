@@ -353,12 +353,27 @@ int stream_frames(Connection& conn, const Options& opts, uint64_t session_id) {
   std::thread send_thread([&]() {
     while (true) {
       SendTask task;
+      bool has_task = false;
       {
         std::unique_lock<std::mutex> lock(send_slot.mutex);
-        send_slot.cv.wait(lock, [&] { return send_slot.has_frame || send_slot.stop; });
+        send_slot.cv.wait_for(lock, std::chrono::seconds(1), [&] {
+          return send_slot.has_frame || send_slot.stop;
+        });
         if (send_slot.stop && !send_slot.has_frame) break;
-        task = std::move(send_slot.task);
-        send_slot.has_frame = false;
+        if (send_slot.has_frame) {
+          task = std::move(send_slot.task);
+          send_slot.has_frame = false;
+          has_task = true;
+        }
+      }
+      if (!has_task) {
+        // 空闲 1 秒没有新帧就发心跳，避免主控端读超时把"画面静止"误判成"断线"。
+        if (!conn.send(MsgType::Heartbeat, session_id, nullptr, 0)) {
+          RC_LOGW("host", "send heartbeat failed");
+          send_failed = true;
+          break;
+        }
+        continue;
       }
       if (!conn.send_video_frame(task.session_id, task.meta, task.data.data(),
                                  task.data.size(), task.frame_id)) {
