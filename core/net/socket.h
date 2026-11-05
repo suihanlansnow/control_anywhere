@@ -36,7 +36,9 @@ class TcpSocket {
   // 分散写：一次系统调用按序发出多段缓冲（最多 3 段），避免把帧头和载荷
   // 拼成一份临时拷贝。部分写会自动推进游标重发。
   bool send_vectored(const uint8_t* const* buffers, const std::size_t* sizes, int count);
-  bool recv_exact(void* data, std::size_t length);
+  // 成功返回 true；对端关闭返回 false 且 timed_out=false；超时返回 false 且
+  // timed_out=true（仅 POSIX + SO_RCVTIMEO 设了正超时才有此区分）。
+  bool recv_exact(void* data, std::size_t length, bool* timed_out = nullptr);
   void set_recv_timeout_ms(int milliseconds);
   // 发送超时：对端长期不读时，send 不能无限阻塞（会连带卡住持锁的调用方）。
   void set_send_timeout_ms(int milliseconds);

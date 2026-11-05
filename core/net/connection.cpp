@@ -115,12 +115,19 @@ bool Connection::send_video_frame(uint64_t session_id, const VideoFrameMeta& met
   return socket_.send_vectored(buffers, sizes, count);
 }
 
-bool Connection::recv(DecodedFrame& out) {
+bool Connection::recv(DecodedFrame& out, bool* timed_out) {
   uint8_t raw_header[kFrameHeaderSize];
-  if (!socket_.recv_exact(raw_header, kFrameHeaderSize)) return false;
+  bool header_timeout = false;
+  if (!socket_.recv_exact(raw_header, kFrameHeaderSize, &header_timeout)) {
+    if (timed_out) *timed_out = header_timeout;
+    return false;
+  }
 
   FrameHeader header;
-  if (!decode_frame_header(raw_header, kFrameHeaderSize, header)) return false;
+  if (!decode_frame_header(raw_header, kFrameHeaderSize, header)) {
+    if (timed_out) *timed_out = false;
+    return false;
+  }
 
   out.type = static_cast<MsgType>(header.type);
   out.flags = header.flags;
@@ -129,10 +136,14 @@ bool Connection::recv(DecodedFrame& out) {
   out.seq = header.seq;
   out.payload.resize(header.payload_len);
 
-  if (header.payload_len > 0 &&
-      !socket_.recv_exact(out.payload.data(), header.payload_len)) {
-    return false;
+  if (header.payload_len > 0) {
+    bool payload_timeout = false;
+    if (!socket_.recv_exact(out.payload.data(), header.payload_len, &payload_timeout)) {
+      if (timed_out) *timed_out = payload_timeout;
+      return false;
+    }
   }
+  if (timed_out) *timed_out = false;
   return true;
 }
 

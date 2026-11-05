@@ -1,5 +1,6 @@
 #include "net/socket.h"
 
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 
@@ -130,16 +131,26 @@ bool TcpSocket::send_vectored(const uint8_t* const* buffers, const std::size_t* 
   return true;
 }
 
-bool TcpSocket::recv_exact(void* data, std::size_t length) {
+bool TcpSocket::recv_exact(void* data, std::size_t length, bool* timed_out) {
   char* cursor = static_cast<char*>(data);
   std::size_t remaining = length;
   while (remaining > 0) {
     const int got = static_cast<int>(
         ::recv(to_native(fd_), cursor, static_cast<int>(remaining), 0));
-    if (got <= 0) return false;
+    if (got <= 0) {
+      if (timed_out) {
+#ifdef _WIN32
+        *timed_out = (got < 0 && WSAGetLastError() == WSAETIMEDOUT);
+#else
+        *timed_out = (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+#endif
+      }
+      return false;
+    }
     cursor += got;
     remaining -= static_cast<std::size_t>(got);
   }
+  if (timed_out) *timed_out = false;
   return true;
 }
 

@@ -50,7 +50,7 @@ class Connection {
   bool send_video_frame(uint64_t session_id, const VideoFrameMeta& meta,
                         const uint8_t* data, std::size_t length, uint32_t seq);
 
-  bool recv(DecodedFrame& out);
+  bool recv(DecodedFrame& out, bool* timed_out = nullptr);
 
   uint32_t next_msg_id() { return msg_id_.fetch_add(1); }
 

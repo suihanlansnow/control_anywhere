@@ -334,7 +334,11 @@ int HostRunner::run() {
 
   while (!stop_flag_.load()) {
     DecodedFrame frame;
-    if (!conn.recv(frame)) break;
+    bool recv_timeout = false;
+    if (!conn.recv(frame, &recv_timeout)) {
+      if (recv_timeout) continue;
+      break;
+    }
 
     switch (frame.type) {
       case MsgType::RegisterAck: {
