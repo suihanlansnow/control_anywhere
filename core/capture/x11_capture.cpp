@@ -163,32 +163,62 @@ static bool ximage_to_bgra_fast(XImage* img, CapturedFrame& frame) {
     return true;
   }
 
+  // 非标准掩码（RGB565、RGB10 等）：把 bpp 分支提到循环外（原来逐像素判断），
+  // 并按通道位宽缩放，避免低位通道（如 RGB565 的 5/6 位）被直接截断丢失精度。
   int rshift = 0, gshift = 0, bshift = 0;
   for (int i = 0; i < 32; ++i) {
     if (rmask & (1u << i)) rshift = i;
     if (gmask & (1u << i)) gshift = i;
     if (bmask & (1u << i)) bshift = i;
   }
+  const int rbits = __builtin_popcount(rmask);
+  const int gbits = __builtin_popcount(gmask);
+  const int bbits = __builtin_popcount(bmask);
+
+  auto to_u8 = [](uint32_t value, int bits) -> uint8_t {
+    if (bits <= 0) return 0;
+    if (bits >= 8) return static_cast<uint8_t>(value >> (bits - 8));
+    return static_cast<uint8_t>(value << (8 - bits));
+  };
 
   const uint8_t* data = reinterpret_cast<const uint8_t*>(img->data);
+  if (img->bits_per_pixel == 32) {
+    for (int y = 0; y < h; ++y) {
+      const uint8_t* src_row = data + y * bpl;
+      uint8_t* dst_row = frame.pixels.data() + y * frame.stride;
+      for (int x = 0; x < w; ++x) {
+        const uint32_t pixel = *reinterpret_cast<const uint32_t*>(src_row + x * 4);
+        dst_row[x * 4 + 0] = to_u8((pixel & bmask) >> bshift, bbits);
+        dst_row[x * 4 + 1] = to_u8((pixel & gmask) >> gshift, gbits);
+        dst_row[x * 4 + 2] = to_u8((pixel & rmask) >> rshift, rbits);
+        dst_row[x * 4 + 3] = 0xFF;
+      }
+    }
+    return true;
+  }
+
+  if (img->bits_per_pixel == 16) {
+    for (int y = 0; y < h; ++y) {
+      const uint8_t* src_row = data + y * bpl;
+      uint8_t* dst_row = frame.pixels.data() + y * frame.stride;
+      for (int x = 0; x < w; ++x) {
+        const uint32_t pixel = *reinterpret_cast<const uint16_t*>(src_row + x * 2);
+        dst_row[x * 4 + 0] = to_u8((pixel & bmask) >> bshift, bbits);
+        dst_row[x * 4 + 1] = to_u8((pixel & gmask) >> gshift, gbits);
+        dst_row[x * 4 + 2] = to_u8((pixel & rmask) >> rshift, rbits);
+        dst_row[x * 4 + 3] = 0xFF;
+      }
+    }
+    return true;
+  }
+
+  // 其他位深（如 8bpp 调色板）无法从掩码还原颜色，输出不透明黑，保持原有兜底行为。
   for (int y = 0; y < h; ++y) {
-    const uint8_t* src_row = data + y * bpl;
     uint8_t* dst_row = frame.pixels.data() + y * frame.stride;
     for (int x = 0; x < w; ++x) {
-      uint32_t pixel = 0;
-      if (img->bits_per_pixel == 32) {
-        pixel = *reinterpret_cast<const uint32_t*>(src_row + x * 4);
-      } else if (img->bits_per_pixel == 16) {
-        pixel = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(src_row + x * 2));
-      } else {
-        pixel = 0;
-      }
-      uint8_t r = static_cast<uint8_t>((pixel & rmask) >> rshift);
-      uint8_t g = static_cast<uint8_t>((pixel & gmask) >> gshift);
-      uint8_t b = static_cast<uint8_t>((pixel & bmask) >> bshift);
-      dst_row[x * 4 + 0] = b;
-      dst_row[x * 4 + 1] = g;
-      dst_row[x * 4 + 2] = r;
+      dst_row[x * 4 + 0] = 0;
+      dst_row[x * 4 + 1] = 0;
+      dst_row[x * 4 + 2] = 0;
       dst_row[x * 4 + 3] = 0xFF;
     }
   }
