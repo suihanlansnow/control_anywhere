@@ -9,7 +9,9 @@ namespace {
 bool allowed(SessionState from, SessionState to) {
   switch (from) {
     case SessionState::Idle:
-      return to == SessionState::Registered || to == SessionState::Closed;
+      // 主控端连中继时不经过 Registered，可直接进入 Connecting。
+      return to == SessionState::Registered || to == SessionState::Connecting ||
+             to == SessionState::Closed;
     case SessionState::Registered:
       return to == SessionState::Connecting || to == SessionState::Invited ||
              to == SessionState::Closing || to == SessionState::Closed;

@@ -648,7 +648,13 @@ int ClientRunner::run() {
     }
 
     DecodedFrame frame;
-    if (!conn.recv(frame)) break;
+    if (!conn.recv(frame)) {
+      // 收包失败通常是 15s 无响应（被控端不回应会话请求）或对端直接断开，
+      // 之前这里静默 break，用户只看到黑窗然后程序消失，无法判断原因。
+      log_("ERROR", "ctrl", "no data from relay within 15s while waiting for host, state=" +
+                        std::string(state_name(guard.state())));
+      return 2;
+    }
 
     switch (frame.type) {
       case MsgType::ConnectRsp: {
