@@ -1,5 +1,6 @@
 # Build
 build/
+build-win/
 out/
 *.o
 *.obj
@@ -39,6 +40,7 @@ qrc_*.cpp
 *.bak
 *.swp
 .dbg/
+.screenshots/
 
 # OS X
 .DS_Store

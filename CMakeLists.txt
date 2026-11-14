@@ -52,6 +52,7 @@ if(UNIX AND NOT APPLE)
 
   list(APPEND RC_CORE_SOURCES
     core/capture/x11_capture.cpp
+    core/input/linux_input_injector.cpp
     core/codec/ffmpeg_jpeg_encoder.cpp
     core/codec/ffmpeg_h264_encoder.cpp
     core/codec/ffmpeg_h264_decoder.cpp
@@ -61,10 +62,11 @@ if(UNIX AND NOT APPLE)
   pkg_check_modules(PIPEWIRE libpipewire-0.3)
   pkg_check_modules(GLIB glib-2.0)
   pkg_check_modules(GIO gio-2.0)
-  if(PIPEWIRE_FOUND AND GLIB_FOUND AND GIO_FOUND)
+  pkg_check_modules(LIBPORTAL libportal)
+  if(PIPEWIRE_FOUND AND GLIB_FOUND AND GIO_FOUND AND LIBPORTAL_FOUND)
     list(APPEND RC_CORE_SOURCES core/capture/pipewire_capture.cpp)
     set(HAVE_PIPEWIRE_CAPTURE ON)
-    message(STATUS "PipeWire ScreenCast capture enabled")
+    message(STATUS "PipeWire ScreenCast capture enabled (portal+pw)")
   else()
     message(STATUS "PipeWire deps not found, pipewire capture disabled")
   endif()
@@ -113,11 +115,14 @@ if(UNIX AND NOT APPLE)
   )
   if(HAVE_PIPEWIRE_CAPTURE)
     target_include_directories(rc_core PUBLIC
-      ${PIPEWIRE_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS} ${GIO_INCLUDE_DIRS})
+      ${PIPEWIRE_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS} ${GIO_INCLUDE_DIRS}
+      ${LIBPORTAL_INCLUDE_DIRS})
     target_link_libraries(rc_core PUBLIC
-      ${PIPEWIRE_LIBRARIES} ${GLIB_LIBRARIES} ${GIO_LIBRARIES})
+      ${PIPEWIRE_LIBRARIES} ${GLIB_LIBRARIES} ${GIO_LIBRARIES}
+      ${LIBPORTAL_LIBRARIES})
     target_link_directories(rc_core PUBLIC
-      ${PIPEWIRE_LIBRARY_DIRS} ${GLIB_LIBRARY_DIRS} ${GIO_LIBRARY_DIRS})
+      ${PIPEWIRE_LIBRARY_DIRS} ${GLIB_LIBRARY_DIRS} ${GIO_LIBRARY_DIRS}
+      ${LIBPORTAL_LIBRARY_DIRS})
     target_compile_definitions(rc_core PUBLIC HAVE_PIPEWIRE_CAPTURE=1)
   endif()
 endif()
@@ -135,10 +140,16 @@ if(UNIX AND NOT APPLE)
 endif()
 target_link_libraries(rc-cli PRIVATE rc_core)
 
-# 桌面 UI 统一用 Qt5：Windows / Linux 共用同一套界面代码与样式。
-option(ENABLE_QT "Build Qt5 GUI app (rc-app)" ON)
+# 桌面 UI 用 Qt：优先 Qt6，找不到再回退 Qt5；两平台共用同一套界面代码与样式。
+option(ENABLE_QT "Build Qt GUI app (rc-app)" ON)
 if(ENABLE_QT)
-  find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
+  find_package(Qt6 QUIET COMPONENTS Core Gui Widgets)
+  if(Qt6_FOUND)
+    set(RC_QT_PREFIX Qt6)
+  else()
+    find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
+    set(RC_QT_PREFIX Qt5)
+  endif()
 
   add_executable(rc-app
     apps/qt/main.cpp
@@ -154,7 +165,7 @@ if(ENABLE_QT)
   )
   target_link_libraries(rc-app PRIVATE
     rc_core
-    Qt5::Core Qt5::Gui Qt5::Widgets
+    ${RC_QT_PREFIX}::Core ${RC_QT_PREFIX}::Gui ${RC_QT_PREFIX}::Widgets
   )
   if(WIN32)
     # GUI 子系统，避免额外弹出控制台窗口。

@@ -3,9 +3,13 @@
 #include <QImage>
 #include <QObject>
 #include <memory>
+#include <mutex>
 
 #include "session/runner.h"
 #include "session/session_config.h"
+
+// 跨线程 invokeMethod 需要该类型可被 Qt 元对象系统识别。
+Q_DECLARE_METATYPE(rc::SessionConfig)
 
 class BackendWorker : public QObject {
   Q_OBJECT
@@ -13,6 +17,9 @@ class BackendWorker : public QObject {
  public:
   explicit BackendWorker(QObject* parent = nullptr);
   ~BackendWorker() override;
+
+  // 从 UI 线程直接调用，仅写入有界队列，不阻塞画面接收线程。
+  void sendInput(const rc::InputEvent& event);
 
  public slots:
   void startHost(const rc::SessionConfig& cfg);
@@ -28,6 +35,7 @@ class BackendWorker : public QObject {
   void finished(int exitCode);
 
  private:
+  std::mutex runner_mutex_;
   std::unique_ptr<rc::HostRunner> host_;
   std::unique_ptr<rc::ClientRunner> client_;
 };

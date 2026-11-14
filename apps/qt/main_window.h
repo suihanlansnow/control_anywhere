@@ -69,11 +69,6 @@ class MainWindow : public QMainWindow {
   QCheckBox* switchAes_ = nullptr;
   QCheckBox* switchCertVerify_ = nullptr;
 
-  QComboBox* comboResolution_ = nullptr;
-  QSlider* sliderFps_ = nullptr;
-  QLabel* labelFpsVal_ = nullptr;
-  QSlider* sliderQuality_ = nullptr;
-  QLabel* labelQualityVal_ = nullptr;
   QComboBox* comboCodec_ = nullptr;
   QCheckBox* switchAutoBitrate_ = nullptr;
 

@@ -1,5 +1,6 @@
 #include "session/runner.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include "protocol/video_payload.h"
 #include "render/renderer.h"
 #ifdef __linux__
+#include "input/linux_input_injector.h"
 #include "render/sdl_renderer.h"
 #else
 #include "render/window_renderer.h"
@@ -54,6 +56,66 @@ static json::Value parse_payload_cfg(const DecodedFrame& frame) {
   } catch (const std::exception&) {
     return make_object();
   }
+}
+
+void write_input_u16(std::vector<uint8_t>& out, std::size_t offset, uint16_t value) {
+  out[offset] = static_cast<uint8_t>(value & 0xff);
+  out[offset + 1] = static_cast<uint8_t>(value >> 8);
+}
+
+void write_input_u32(std::vector<uint8_t>& out, std::size_t offset, uint32_t value) {
+  for (int i = 0; i < 4; ++i) {
+    out[offset + i] = static_cast<uint8_t>((value >> (i * 8)) & 0xff);
+  }
+}
+
+uint16_t read_input_u16(const std::vector<uint8_t>& data, std::size_t offset) {
+  return static_cast<uint16_t>(data[offset] | (data[offset + 1] << 8));
+}
+
+uint32_t read_input_u32(const std::vector<uint8_t>& data, std::size_t offset) {
+  uint32_t value = 0;
+  for (int i = 0; i < 4; ++i) {
+    value |= static_cast<uint32_t>(data[offset + i]) << (i * 8);
+  }
+  return value;
+}
+
+std::vector<uint8_t> encode_input_event(const InputEvent& event) {
+  std::vector<uint8_t> out;
+  switch (event.type) {
+    case MsgType::InputMouseMove:
+      out.resize(10, 0);
+      write_input_u32(out, 0, static_cast<uint32_t>(now_ms()));
+      write_input_u16(out, 4, static_cast<uint16_t>(std::clamp(event.x, 0, 65535)));
+      write_input_u16(out, 6, static_cast<uint16_t>(std::clamp(event.y, 0, 65535)));
+      break;
+    case MsgType::InputMouseButton:
+      out.resize(12, 0);
+      write_input_u32(out, 0, static_cast<uint32_t>(now_ms()));
+      out[4] = static_cast<uint8_t>(event.button);
+      out[5] = static_cast<uint8_t>(event.state != 0);
+      write_input_u16(out, 6, static_cast<uint16_t>(std::clamp(event.x, 0, 65535)));
+      write_input_u16(out, 8, static_cast<uint16_t>(std::clamp(event.y, 0, 65535)));
+      break;
+    case MsgType::InputMouseWheel:
+      out.resize(8, 0);
+      write_input_u32(out, 0, static_cast<uint32_t>(now_ms()));
+      write_input_u16(out, 4, static_cast<uint16_t>(static_cast<int16_t>(
+          std::clamp(event.delta_x, -32768, 32767))));
+      write_input_u16(out, 6, static_cast<uint16_t>(static_cast<int16_t>(
+          std::clamp(event.delta_y, -32768, 32767))));
+      break;
+    case MsgType::InputKey:
+      out.resize(12, 0);
+      write_input_u32(out, 0, static_cast<uint32_t>(now_ms()));
+      write_input_u32(out, 4, static_cast<uint32_t>(event.key));
+      out[8] = static_cast<uint8_t>(std::clamp(event.state, 0, 2));
+      break;
+    default:
+      break;
+  }
+  return out;
 }
 
 HostRunner::HostRunner(const SessionConfig& cfg) : cfg_(cfg) {}
@@ -158,8 +220,75 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   std::atomic<int> sent_count{0};
   std::atomic<uint64_t> sent_bytes{0};
   std::atomic<bool> send_failed{false};
+  std::atomic<bool> stream_closed{false};
+  std::atomic<bool> control_stop{false};
 
   const int frame_interval_ms = std::max(1, 1000 / fps);
+
+#ifdef __linux__
+  LinuxInputInjector input_injector;
+  std::string input_error;
+  if (input_injector.start(width, height, &input_error)) {
+    log_("INFO", "input", "uinput keyboard/mouse ready");
+  } else {
+    log_("WARN", "input", "remote input unavailable: " + input_error);
+  }
+#endif
+
+  // 推流期间也要接收控制消息，否则主控断开后中继发来的 SessionClose
+  // 会一直堆在接收缓冲区，Host 无法结束旧会话或接受下一次连接。
+  conn.set_recv_timeout_ms(200);
+  std::thread control_thread([&]() {
+    while (!control_stop.load() && !stop_flag_.load()) {
+      DecodedFrame incoming;
+      bool recv_timeout = false;
+      if (!conn.recv(incoming, &recv_timeout)) {
+        if (recv_timeout) continue;
+        stream_closed.store(true);
+        break;
+      }
+      if (incoming.type == MsgType::SessionClose && incoming.session_id == session_id) {
+        json::Value ack = make_object();
+        ack.set("reason", "ack");
+        conn.send_json(MsgType::SessionClose, session_id, ack);
+        stream_closed.store(true);
+        break;
+      }
+      if (incoming.session_id != session_id) continue;
+#ifdef __linux__
+      switch (incoming.type) {
+        case MsgType::InputMouseMove:
+          if (incoming.payload.size() >= 10) {
+            input_injector.mouse_move(read_input_u16(incoming.payload, 4),
+                                      read_input_u16(incoming.payload, 6));
+          }
+          break;
+        case MsgType::InputMouseButton:
+          if (incoming.payload.size() >= 12) {
+            input_injector.mouse_button(incoming.payload[4], incoming.payload[5] != 0,
+                                        read_input_u16(incoming.payload, 6),
+                                        read_input_u16(incoming.payload, 8));
+          }
+          break;
+        case MsgType::InputMouseWheel:
+          if (incoming.payload.size() >= 8) {
+            input_injector.mouse_wheel(
+                static_cast<int16_t>(read_input_u16(incoming.payload, 4)),
+                static_cast<int16_t>(read_input_u16(incoming.payload, 6)));
+          }
+          break;
+        case MsgType::InputKey:
+          if (incoming.payload.size() >= 12) {
+            input_injector.key(static_cast<int>(read_input_u32(incoming.payload, 4)),
+                               incoming.payload[8]);
+          }
+          break;
+        default:
+          break;
+      }
+#endif
+    }
+  });
 
   std::thread capture_thread([&, source = std::move(capture)]() mutable {
     while (true) {
@@ -227,17 +356,21 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   uint32_t frame_id = 0;
   auto next_slot = std::chrono::steady_clock::now();
   auto frame_interval = std::chrono::milliseconds(frame_interval_ms);
+  CapturedFrame last_frame;
+  bool has_last = false;
 
-  while (!stop_flag_.load() && !send_failed.load()) {
-    CapturedFrame frame;
+  while (!stop_flag_.load() && !send_failed.load() && !stream_closed.load()) {
+    bool fresh = false;
     {
       std::unique_lock<std::mutex> lock(slot.mutex);
       // 等到节拍点，期间有新帧就提前取走（队列深度 1，后来的覆盖先来的）。
       slot.cv.wait_until(lock, next_slot, [&slot] { return slot.has_frame || slot.stop; });
       if (slot.stop) { stop_flag_.store(true); break; }
       if (slot.has_frame) {
-        frame = std::move(slot.frame);
+        last_frame = std::move(slot.frame);
         slot.has_frame = false;
+        has_last = true;
+        fresh = true;
       }
     }
     next_slot += frame_interval;
@@ -245,12 +378,15 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
       next_slot = std::chrono::steady_clock::now();
     }
 
-    // 画面静止时这一拍没有新帧：节拍已推进，跳过编码不会空转。
-    if (frame.pixels.empty() && !frame.gpu_texture) continue;
+    if (!has_last) continue;
+    if (!fresh) {
+      // 静止画面没有新帧时复用上一帧，维持目标帧率和持续视频流。
+      last_frame.capture_ts_us = static_cast<int64_t>(now_us());
+    }
 
     EncodedFrame encoded;
     std::string enc_error;
-    if (!encoder->encode(frame, encoded, &enc_error)) {
+    if (!encoder->encode(last_frame, encoded, &enc_error)) {
       log_("WARN", "host", "encode failed: " + enc_error);
       continue;
     }
@@ -301,6 +437,10 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   }
   send_slot.cv.notify_all();
   send_thread.join();
+
+  control_stop.store(true);
+  control_thread.join();
+  conn.set_recv_timeout_ms(30000);
 
   encoder->close();
   log_("INFO", "host", "frames_encoded=" + std::to_string(encoded_count) +
@@ -400,13 +540,18 @@ int HostRunner::run() {
         guard.move_to(SessionState::Streaming);
         log_("INFO", "host", "authentication passed, starting capture/encode");
         stream_frames_(conn, session_id);
+        guard = SessionGuard(SessionState::Registered);
+        session_id = 0;
+        nonce.clear();
+        log_("INFO", "host", "session ended, waiting for next controller");
+        if (status_cb_) status_cb_("registered");
         break;
       }
       case MsgType::SessionClose: {
         json::Value ack = make_object();
         ack.set("reason", "ack");
         conn.send_json(MsgType::SessionClose, session_id, ack);
-        guard.move_to(SessionState::Registered);
+        guard = SessionGuard(SessionState::Registered);
         session_id = 0;
         nonce.clear();
         log_("INFO", "host", "session closed, waiting for next controller");
@@ -425,7 +570,27 @@ int HostRunner::run() {
 ClientRunner::ClientRunner(const SessionConfig& cfg) : cfg_(cfg) {}
 ClientRunner::~ClientRunner() { stop(); }
 
-void ClientRunner::stop() { stop_flag_.store(true); }
+void ClientRunner::stop() {
+  stop_flag_.store(true);
+  input_stop_.store(true);
+  input_cv_.notify_all();
+}
+
+void ClientRunner::send_input(const InputEvent& event) {
+  if (input_stop_.load() || input_session_.load() == 0) return;
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (event.type == MsgType::InputMouseMove && !input_queue_.empty() &&
+        input_queue_.back().type == MsgType::InputMouseMove) {
+      input_queue_.back() = event;
+    } else {
+      input_queue_.push_back(event);
+    }
+    // 输入只保留最新状态，避免网络变慢后继续执行一串过期鼠标事件。
+    while (input_queue_.size() > 512) input_queue_.pop_front();
+  }
+  input_cv_.notify_one();
+}
 
 void ClientRunner::log_(const std::string& level, const std::string& tag, const std::string& msg) {
   if (log_cb_) {
@@ -634,6 +799,37 @@ int ClientRunner::run() {
     }
   } hb_joiner{&hb_stop, &hb_thread};
 
+  std::thread input_thread([&]() {
+    while (true) {
+      InputEvent event;
+      {
+        std::unique_lock<std::mutex> lock(input_mutex_);
+        input_cv_.wait(lock, [&] { return input_stop_.load() || !input_queue_.empty(); });
+        if (input_stop_.load()) break;
+        event = input_queue_.front();
+        input_queue_.pop_front();
+      }
+      const uint64_t sid = input_session_.load();
+      if (sid == 0) continue;
+      const std::vector<uint8_t> payload = encode_input_event(event);
+      if (!payload.empty() &&
+          !conn.send(event.type, sid, payload.data(), payload.size())) {
+        stop_flag_.store(true);
+        break;
+      }
+    }
+  });
+  struct InputJoiner {
+    std::atomic<bool>* stop;
+    std::condition_variable* cv;
+    std::thread* thread;
+    ~InputJoiner() {
+      stop->store(true);
+      cv->notify_all();
+      if (thread->joinable()) thread->join();
+    }
+  } input_joiner{&input_stop_, &input_cv_, &input_thread};
+
   while (!stop_flag_.load()) {
     if (renderer) {
       renderer->pump();
@@ -685,6 +881,7 @@ int ClientRunner::run() {
         }
         session_id = frame.session_id;
         hb_session.store(session_id);
+        input_session_.store(session_id);
         guard.move_to(SessionState::Ready);
         log_("INFO", "ctrl", "session " + std::to_string(session_id) + " accepted by host");
         break;
@@ -747,6 +944,7 @@ int ClientRunner::run() {
         ack.set("reason", "ack");
         conn.send_json(MsgType::SessionClose, session_id, ack);
         guard.move_to(SessionState::Closed);
+        input_session_.store(0);
         log_("INFO", "ctrl", "session closed by host");
         if (status_cb_) status_cb_("closed");
         return 0;

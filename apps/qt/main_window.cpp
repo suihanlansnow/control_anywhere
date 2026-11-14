@@ -1,6 +1,9 @@
 #include <QApplication>
 #include "main_window.h"
 
+#include <algorithm>
+#include <functional>
+
 // 同一套 UI 在两平台复用，仅采集后端与默认设备名按平台切换。
 #if defined(_WIN32)
 static constexpr const char* kPlatformHostId = "win-host";
@@ -23,12 +26,15 @@ static constexpr const char* kPlatformName = "Linux";
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QImage>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QPushButton>
+#include <QSet>
 #include <QSettings>
 #include <QSizePolicy>
 #include <QSlider>
@@ -36,15 +42,20 @@ static constexpr const char* kPlatformName = "Linux";
 #include <QStackedWidget>
 #include <QTextEdit>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 #include <QWidget>
 
 namespace {
 
 class VideoWidget : public QWidget {
  public:
+  using InputCallback = std::function<void(const rc::InputEvent&)>;
+
   explicit VideoWidget(QWidget* parent = nullptr) : QWidget(parent) {
     setMinimumHeight(320);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    setFocusPolicy(Qt::StrongFocus);
+    setMouseTracking(true);
     setStyleSheet("background-color:#101014; color:#8a8f98; border-radius:6px;");
   }
 
@@ -58,10 +69,61 @@ class VideoWidget : public QWidget {
     update();
   }
 
+  void setInputCallback(InputCallback callback) { input_callback_ = std::move(callback); }
+
+  void toggleFullscreen() {
+    if (isFullScreen()) {
+      releaseAll();
+      showNormal();
+      if (home_parent_) {
+        setParent(home_parent_, Qt::Widget);
+        if (home_layout_) home_layout_->insertWidget(home_index_, this, 1);
+      }
+      show();
+    } else {
+      home_parent_ = parentWidget();
+      home_layout_ = home_parent_ ? qobject_cast<QVBoxLayout*>(home_parent_->layout()) : nullptr;
+      home_index_ = home_layout_ ? home_layout_->indexOf(this) : 0;
+      setParent(nullptr, Qt::Window | Qt::FramelessWindowHint);
+      showFullScreen();
+      activateWindow();
+      setFocus(Qt::ActiveWindowFocusReason);
+    }
+    update();
+  }
+
+  void releaseAll() {
+    if (!input_callback_) {
+      pressed_keys_.clear();
+      pressed_buttons_.clear();
+      return;
+    }
+    const auto keys = pressed_keys_;
+    const auto buttons = pressed_buttons_;
+    pressed_keys_.clear();
+    pressed_buttons_.clear();
+    for (int key : keys) {
+      rc::InputEvent event;
+      event.type = rc::MsgType::InputKey;
+      event.key = key;
+      event.state = 0;
+      input_callback_(event);
+    }
+    for (int button : buttons) {
+      rc::InputEvent event;
+      event.type = rc::MsgType::InputMouseButton;
+      event.button = button;
+      event.state = 0;
+      event.x = last_remote_x_;
+      event.y = last_remote_y_;
+      input_callback_(event);
+    }
+  }
+
  protected:
   void paintEvent(QPaintEvent*) override {
     QPainter p(this);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
     p.fillRect(rect(), QColor("#101014"));
 
     if (frame_.isNull()) {
@@ -69,16 +131,172 @@ class VideoWidget : public QWidget {
       p.drawText(rect(), Qt::AlignCenter, placeholder_);
       return;
     }
+    p.drawImage(frameRect(), frame_);
+    if (isFullScreen()) {
+      p.fillRect(QRect(12, 12, 188, 30), QColor(0, 0, 0, 150));
+      p.setPen(QColor("#e0e0e0"));
+      p.drawText(QRect(22, 12, 178, 30), Qt::AlignVCenter, tr("F11 / Esc 退出全屏"));
+    }
+  }
 
-    const QSize s = frame_.size().scaled(rect().size(), Qt::KeepAspectRatio);
-    const int x = (width() - s.width()) / 2;
-    const int y = (height() - s.height()) / 2;
-    p.drawImage(QRect(x, y, s.width(), s.height()), frame_);
+  void mouseMoveEvent(QMouseEvent* event) override {
+    sendMouseMove(event->pos());
+    event->accept();
+  }
+
+  void mousePressEvent(QMouseEvent* event) override {
+    setFocus(Qt::MouseFocusReason);
+    sendMouseButton(event, true);
+    event->accept();
+  }
+
+  void mouseReleaseEvent(QMouseEvent* event) override {
+    sendMouseButton(event, false);
+    event->accept();
+  }
+
+  void mouseDoubleClickEvent(QMouseEvent* event) override {
+    sendMouseButton(event, true);
+    event->accept();
+  }
+
+  void wheelEvent(QWheelEvent* event) override {
+    const QPoint delta = event->angleDelta();
+    if (!frame_.isNull() && input_callback_ && !delta.isNull()) {
+      rc::InputEvent input;
+      input.type = rc::MsgType::InputMouseWheel;
+      input.delta_x = delta.x();
+      input.delta_y = delta.y();
+      input_callback_(input);
+    }
+    event->accept();
+  }
+
+  void keyPressEvent(QKeyEvent* event) override {
+    if (event->key() == Qt::Key_F11) {
+      toggleFullscreen();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_Escape && isFullScreen()) {
+      toggleFullscreen();
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_unknown || !input_callback_ || frame_.isNull()) {
+      QWidget::keyPressEvent(event);
+      return;
+    }
+    const int key = event->key();
+    if (!event->isAutoRepeat()) pressed_keys_.insert(key);
+    rc::InputEvent input;
+    input.type = rc::MsgType::InputKey;
+    input.key = key;
+    input.state = event->isAutoRepeat() ? 2 : 1;
+    input_callback_(input);
+    event->accept();
+  }
+
+  void keyReleaseEvent(QKeyEvent* event) override {
+    if (event->key() == Qt::Key_F11) {
+      event->accept();
+      return;
+    }
+    if (event->key() == Qt::Key_unknown || !input_callback_ || frame_.isNull()) {
+      QWidget::keyReleaseEvent(event);
+      return;
+    }
+    const int key = event->key();
+    pressed_keys_.remove(key);
+    rc::InputEvent input;
+    input.type = rc::MsgType::InputKey;
+    input.key = key;
+    input.state = 0;
+    input_callback_(input);
+    event->accept();
+  }
+
+  void focusOutEvent(QFocusEvent* event) override {
+    releaseAll();
+    QWidget::focusOutEvent(event);
   }
 
  private:
+  QRect frameRect() const {
+    if (frame_.isNull()) return {};
+    const QSize size = frame_.size().scaled(rect().size(), Qt::KeepAspectRatio);
+    return QRect((width() - size.width()) / 2, (height() - size.height()) / 2,
+                 size.width(), size.height());
+  }
+
+  bool remotePosition(const QPoint& point, int& x, int& y) const {
+    const QRect target = frameRect();
+    if (!target.isValid() || !target.contains(point)) return false;
+    x = std::clamp((point.x() - target.x()) * frame_.width() / target.width(),
+                   0, frame_.width() - 1);
+    y = std::clamp((point.y() - target.y()) * frame_.height() / target.height(),
+                   0, frame_.height() - 1);
+    return true;
+  }
+
+  static int mouseButton(Qt::MouseButton button) {
+    switch (button) {
+      case Qt::LeftButton: return 1;
+      case Qt::RightButton: return 2;
+      case Qt::MiddleButton: return 3;
+      case Qt::BackButton: return 4;
+      case Qt::ForwardButton: return 5;
+      default: return 0;
+    }
+  }
+
+  void sendMouseMove(const QPoint& point) {
+    int x = 0;
+    int y = 0;
+    if (!input_callback_ || !remotePosition(point, x, y)) return;
+    last_remote_x_ = x;
+    last_remote_y_ = y;
+    rc::InputEvent input;
+    input.type = rc::MsgType::InputMouseMove;
+    input.x = x;
+    input.y = y;
+    input_callback_(input);
+  }
+
+  void sendMouseButton(QMouseEvent* mouse, bool pressed) {
+    const int button = mouseButton(mouse->button());
+    if (button == 0 || !input_callback_) return;
+    int x = last_remote_x_;
+    int y = last_remote_y_;
+    if (!remotePosition(mouse->pos(), x, y)) {
+      if (pressed) return;
+      x = last_remote_x_;
+      y = last_remote_y_;
+    }
+    sendMouseMove(mouse->pos());
+    last_remote_x_ = x;
+    last_remote_y_ = y;
+    if (pressed) pressed_buttons_.insert(button);
+    else pressed_buttons_.remove(button);
+    rc::InputEvent input;
+    input.type = rc::MsgType::InputMouseButton;
+    input.button = button;
+    input.state = pressed ? 1 : 0;
+    input.x = x;
+    input.y = y;
+    input_callback_(input);
+  }
+
   QImage frame_;
   QString placeholder_{tr("等待远程画面…")};
+  InputCallback input_callback_;
+  QSet<int> pressed_keys_;
+  QSet<int> pressed_buttons_;
+  int last_remote_x_ = 0;
+  int last_remote_y_ = 0;
+  QWidget* home_parent_ = nullptr;
+  QVBoxLayout* home_layout_ = nullptr;
+  int home_index_ = 0;
 };
 
 }  // namespace
@@ -108,6 +326,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
 MainWindow::~MainWindow() {
   saveSettings();
+  if (videoView_) {
+    auto* video = static_cast<VideoWidget*>(videoView_);
+    video->releaseAll();
+    if (video->isFullScreen()) video->toggleFullscreen();
+  }
   if (workerThread_) {
     worker_->stop();
     workerThread_->quit();
@@ -365,7 +588,7 @@ QWidget* MainWindow::buildDisplayPanel() {
   hl->setSpacing(4);
   auto* title = new QLabel(tr("显示"));
   title->setObjectName("PanelTitle");
-  auto* desc = new QLabel(tr("调整画面分辨率、帧率与编码质量。"));
+  auto* desc = new QLabel(tr("远程画面按实际视频帧显示，支持全屏及远程鼠标、键盘操作。"));
   desc->setObjectName("PanelDesc");
   desc->setWordWrap(true);
   hl->addWidget(title);
@@ -376,65 +599,30 @@ QWidget* MainWindow::buildDisplayPanel() {
   cardVideo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
   {
     auto* vbox = static_cast<QVBoxLayout*>(cardVideo->layout());
+    auto* toolRow = new QHBoxLayout();
+    auto* inputHint = new QLabel(tr("单击画面后即可操作远程系统，F11 全屏，Esc 退出"));
+    inputHint->setObjectName("FieldHint");
+    auto* fullscreenBtn = new QPushButton(tr("全屏（F11）"));
+    fullscreenBtn->setObjectName("BtnGhost");
+    toolRow->addWidget(inputHint, 1);
+    toolRow->addWidget(fullscreenBtn);
+    vbox->addLayout(toolRow);
+
     videoView_ = new VideoWidget();
     vbox->addWidget(videoView_, 1);
+    auto* video = static_cast<VideoWidget*>(videoView_);
+    connect(fullscreenBtn, &QPushButton::clicked, video, &VideoWidget::toggleFullscreen);
+    video->setInputCallback([this](const rc::InputEvent& event) {
+      if (!worker_) return;
+      if (event.type == rc::MsgType::InputKey) {
+        if (switchKeyboard_ && !switchKeyboard_->isChecked()) return;
+      } else if (switchMouse_ && !switchMouse_->isChecked()) {
+        return;
+      }
+      worker_->sendInput(event);
+    });
   }
   scroll->addWidget(cardVideo, 1);
-
-  auto* card1 = makeCard(tr("画面质量"));
-  {
-    auto* vbox = static_cast<QVBoxLayout*>(card1->layout());
-    auto* lbl1 = new QLabel(tr("分辨率"));
-    lbl1->setObjectName("FieldLabel");
-    vbox->addWidget(lbl1);
-    comboResolution_ = new QComboBox();
-    comboResolution_->addItem("1920 × 1080", "1920x1080");
-    comboResolution_->addItem("2560 × 1440", "2560x1440");
-    comboResolution_->addItem("3840 × 2160", "3840x2160");
-    comboResolution_->addItem("1280 × 720", "1280x720");
-    comboResolution_->setCurrentIndex(0);
-    vbox->addWidget(comboResolution_);
-
-    auto* lbl2 = new QLabel(tr("帧率"));
-    lbl2->setObjectName("FieldLabel");
-    vbox->addWidget(lbl2);
-    auto* fpsRow = new QHBoxLayout();
-    fpsRow->setSpacing(12);
-    sliderFps_ = new QSlider(Qt::Horizontal);
-    sliderFps_->setRange(15, 120);
-    sliderFps_->setValue(60);
-    labelFpsVal_ = new QLabel("60 fps");
-    labelFpsVal_->setMinimumWidth(60);
-    labelFpsVal_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    labelFpsVal_->setStyleSheet("font-weight:600; color:#1f7a45;");
-    fpsRow->addWidget(sliderFps_, 1);
-    fpsRow->addWidget(labelFpsVal_);
-    vbox->addLayout(fpsRow);
-
-    auto* lbl3 = new QLabel(tr("编码质量"));
-    lbl3->setObjectName("FieldLabel");
-    vbox->addWidget(lbl3);
-    auto* qRow = new QHBoxLayout();
-    qRow->setSpacing(12);
-    sliderQuality_ = new QSlider(Qt::Horizontal);
-    sliderQuality_->setRange(1, 100);
-    sliderQuality_->setValue(80);
-    labelQualityVal_ = new QLabel("80");
-    labelQualityVal_->setMinimumWidth(44);
-    labelQualityVal_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    labelQualityVal_->setStyleSheet("font-weight:600; color:#1f7a45;");
-    qRow->addWidget(sliderQuality_, 1);
-    qRow->addWidget(labelQualityVal_);
-    vbox->addLayout(qRow);
-
-    connect(sliderFps_, &QSlider::valueChanged, this, [this](int v) {
-      labelFpsVal_->setText(QString("%1 fps").arg(v));
-    });
-    connect(sliderQuality_, &QSlider::valueChanged, this, [this](int v) {
-      labelQualityVal_->setText(QString::number(v));
-    });
-  }
-  scroll->addWidget(card1);
 
   auto* card2 = makeCard(tr("编码与渲染"));
   {
@@ -835,8 +1023,6 @@ void MainWindow::onStartHost() {
   cfg.device_id = editDeviceId_ ? editDeviceId_->text().toStdString() : kPlatformHostId;
   cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
   cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
-  cfg.fps = sliderFps_ ? sliderFps_->value() : 60;
-  cfg.quality = sliderQuality_ ? sliderQuality_->value() : 75;
   cfg.capture = kPlatformCapture;
 
   QMetaObject::invokeMethod(worker_, "startHost", Qt::QueuedConnection,
@@ -851,13 +1037,13 @@ void MainWindow::onStartClient() {
   cfg.target_id = editDeviceId_ ? editDeviceId_->text().toStdString() : kPlatformHostId;
   cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
   cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
-  cfg.fps = sliderFps_ ? sliderFps_->value() : 60;
 
   QMetaObject::invokeMethod(worker_, "startClient", Qt::QueuedConnection,
                             Q_ARG(rc::SessionConfig, cfg));
 }
 
 void MainWindow::onStop() {
+  if (videoView_) static_cast<VideoWidget*>(videoView_)->releaseAll();
   if (worker_) worker_->stop();
 }
 
@@ -925,9 +1111,6 @@ void MainWindow::saveSettings() {
   s.setValue("security/aes", switchAes_ ? switchAes_->isChecked() : true);
   s.setValue("security/cert_verify", switchCertVerify_ ? switchCertVerify_->isChecked() : true);
   if (comboCodec_) s.setValue("display/codec", comboCodec_->currentData().toString());
-  s.setValue("display/fps", sliderFps_ ? sliderFps_->value() : 60);
-  s.setValue("display/quality", sliderQuality_ ? sliderQuality_->value() : 75);
-  if (comboResolution_) s.setValue("display/resolution", comboResolution_->currentIndex());
   s.setValue("display/auto_bitrate", switchAutoBitrate_ ? switchAutoBitrate_->isChecked() : false);
   s.setValue("network/timeout", sliderTimeout_ ? sliderTimeout_->value() : 30);
   s.setValue("network/auto_reconnect", switchAutoReconnect_ ? switchAutoReconnect_->isChecked() : true);
@@ -954,9 +1137,6 @@ void MainWindow::loadSettings() {
     const int idx = comboCodec_->findData(codec);
     if (idx >= 0) comboCodec_->setCurrentIndex(idx);
   }
-  if (sliderFps_) sliderFps_->setValue(s.value("display/fps", 60).toInt());
-  if (sliderQuality_) sliderQuality_->setValue(s.value("display/quality", 75).toInt());
-  if (comboResolution_) comboResolution_->setCurrentIndex(s.value("display/resolution", 0).toInt());
   if (switchAutoBitrate_) switchAutoBitrate_->setChecked(s.value("display/auto_bitrate", false).toBool());
   if (sliderTimeout_) sliderTimeout_->setValue(s.value("network/timeout", 30).toInt());
   if (switchAutoReconnect_) switchAutoReconnect_->setChecked(s.value("network/auto_reconnect", true).toBool());
