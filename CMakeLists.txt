@@ -31,6 +31,7 @@ set(RC_CORE_SOURCES
 if(WIN32)
   list(APPEND RC_CORE_SOURCES
     core/capture/dxgi_capture.cpp
+    core/input/windows_input_injector.cpp
     core/codec/jpeg_encoder.cpp
     core/codec/h264_mf_encoder.cpp
     core/codec/h264_decoder.cpp
@@ -81,7 +82,7 @@ target_include_directories(rc_core PUBLIC
 
 if(WIN32)
   target_link_libraries(rc_core PUBLIC
-    ws2_32 d3d11 dxgi ole32 windowscodecs mfplat mfuuid mf)
+    ws2_32 d3d11 dxgi ole32 windowscodecs mfplat mfuuid mf user32)
 endif()
 
 if(UNIX AND NOT APPLE)

@@ -21,11 +21,20 @@
 #ifdef __linux__
 #include "input/linux_input_injector.h"
 #include "render/sdl_renderer.h"
-#else
+#elif defined(_WIN32)
+#include "input/windows_input_injector.h"
 #include "render/window_renderer.h"
 #endif
 
 namespace rc {
+
+#if defined(__linux__)
+using PlatformInputInjector = LinuxInputInjector;
+static constexpr const char* kInputBackendName = "uinput";
+#elif defined(_WIN32)
+using PlatformInputInjector = WindowsInputInjector;
+static constexpr const char* kInputBackendName = "SendInput";
+#endif
 
 static json::Value make_object() { return json::Value::make_object(); }
 
@@ -225,11 +234,11 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
 
   const int frame_interval_ms = std::max(1, 1000 / fps);
 
-#ifdef __linux__
-  LinuxInputInjector input_injector;
+#if defined(__linux__) || defined(_WIN32)
+  PlatformInputInjector input_injector;
   std::string input_error;
   if (input_injector.start(width, height, &input_error)) {
-    log_("INFO", "input", "uinput keyboard/mouse ready");
+    log_("INFO", "input", std::string(kInputBackendName) + " keyboard/mouse ready");
   } else {
     log_("WARN", "input", "remote input unavailable: " + input_error);
   }
@@ -255,7 +264,7 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
         break;
       }
       if (incoming.session_id != session_id) continue;
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
       switch (incoming.type) {
         case MsgType::InputMouseMove:
           if (incoming.payload.size() >= 10) {
