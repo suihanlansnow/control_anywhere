@@ -51,6 +51,7 @@ class HostRunner {
 
   SessionConfig cfg_;
   std::atomic<bool> stop_flag_{false};
+  std::atomic<int> requested_fps_{0};  // 主控在会话邀请里协商的 max_fps
   LogCallback log_cb_;
   StatusCallback status_cb_;
   ProgressCallback progress_cb_;

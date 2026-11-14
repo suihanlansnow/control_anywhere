@@ -184,7 +184,10 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   capture->grab(probe, 300);
   int width = probe.width;
   int height = probe.height;
+  // 主控协商的 max_fps 只降不升，避免覆盖被控端自己的上限。
   int fps = cfg_.fps > 0 ? cfg_.fps : 60;
+  const int requested_fps = requested_fps_.exchange(0);
+  if (requested_fps > 0 && requested_fps < fps) fps = requested_fps;
   if (!encoder->open(width, height, fps, cfg_.quality, &error)) {
     log_("ERROR", "host", "encoder open failed: " + error);
     return 0;
@@ -508,6 +511,13 @@ int HostRunner::run() {
         if (const json::Value* from_field = payload.get("from")) {
           if (const json::Value* id_field = from_field->get("id")) {
             from = id_field->as_string("unknown");
+          }
+        }
+        // 主控在 ConnectReq.want 里声明可接受的最高帧率，这里记录后按需降帧编码。
+        requested_fps_.store(0);  // 本次邀请未声明时不能沿用上一会话的值
+        if (const json::Value* want_field = payload.get("want")) {
+          if (const json::Value* fps_field = want_field->get("max_fps")) {
+            requested_fps_.store(static_cast<int>(fps_field->as_int(0)));
           }
         }
         guard.move_to(SessionState::Invited);

@@ -154,6 +154,12 @@ bool TcpSocket::recv_exact(void* data, std::size_t length, bool* timed_out) {
   return true;
 }
 
+int TcpSocket::recv_some(void* data, std::size_t length) {
+  if (fd_ == -1 || length == 0) return -1;
+  return static_cast<int>(
+      ::recv(to_native(fd_), static_cast<char*>(data), static_cast<int>(length), 0));
+}
+
 void TcpSocket::set_recv_timeout_ms(int milliseconds) {
 #ifdef _WIN32
   DWORD timeout = static_cast<DWORD>(milliseconds);

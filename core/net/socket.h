@@ -39,6 +39,9 @@ class TcpSocket {
   // 成功返回 true；对端关闭返回 false 且 timed_out=false；超时返回 false 且
   // timed_out=true（仅 POSIX + SO_RCVTIMEO 设了正超时才有此区分）。
   bool recv_exact(void* data, std::size_t length, bool* timed_out = nullptr);
+  // 读取最多 length 字节，返回实际字节数；<=0 表示出错、超时或对端关闭。
+  // HTTP 之类按分隔符解析的协议需要“读多少算多少”的语义。
+  int recv_some(void* data, std::size_t length);
   void set_recv_timeout_ms(int milliseconds);
   // 发送超时：对端长期不读时，send 不能无限阻塞（会连带卡住持锁的调用方）。
   void set_send_timeout_ms(int milliseconds);

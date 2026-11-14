@@ -131,6 +131,14 @@ endif()
 add_executable(rc-relay server/relay/main.cpp)
 target_link_libraries(rc-relay PRIVATE rc_core)
 
+# Web 预览/控制网关：复用 ClientRunner 的会话与解码，向浏览器输出 MJPEG。
+add_executable(rc-web
+  server/web/main.cpp
+  server/web/http_server.cpp
+  server/web/web_page.cpp
+)
+target_link_libraries(rc-web PRIVATE rc_core)
+
 add_executable(rc-cli apps/cli/main.cpp)
 if(WIN32)
   target_sources(rc-cli PRIVATE core/render/window_renderer.cpp)
