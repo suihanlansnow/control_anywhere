@@ -77,6 +77,12 @@ rc-relay --port 21116
 
 # TLS 加密（推荐公网部署；--tls-cert/--tls-key 为 PEM 文件）
 rc-relay --port 21116 --tls-cert relay.pem --tls-key relay-key.pem
+
+# 跨机/NAT 部署时声明对外地址；省略则回填主控端实际连接到的本机地址
+rc-relay --port 21116 --advertise-host 203.0.113.10
+
+# 邀请等待被控端响应的超时（秒，默认 60），超时会清理并向主控端回 session_expired
+rc-relay --port 21116 --session-ttl 60
 ```
 
 启用 TLS 后，被控端与主控端都要加 `--tls`，并用以下三种方式之一校验证书：
@@ -200,6 +206,7 @@ rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
 - **能力协商**：`CapsNegotiate` 收敛编码器、帧率与质量；`VideoConfig` 下发参数；`KeyframeReq` 强制 IDR；`VideoStats` 每秒回传编码统计。
 - **HMAC-SHA256 鉴权**：中继下发挑战，被控端用密码生成 proof，主控端回传验证。
 - **鉴权保护**：密码失败按主控设备号指数退避锁定，并有 60 秒全局失败窗口；被控端可要求本机弹窗确认连接。
+- **邀请超时清理**：待被控端确认的会话默认 60 秒过期（`--session-ttl` 可调），自动清理并通知主控端。
 - **设备身份与防顶号**：被控端用本地 EC P-256 私钥响应中继挑战，中继按设备号固定公钥并持久化，异键注册被拒。
 - **可选 TLS**：中继与两端之间支持 mbed TLS 加密，可用 CA、证书指纹或显式不安全模式校验。
 - **跨平台采集**：Windows DXGI；Linux X11 或 PipeWire（xdg-desktop-portal）。

@@ -37,6 +37,8 @@ class TcpSocket {
                         std::string* error);
   bool tls_active() const { return tls_ != nullptr; }
   std::string tls_peer_fingerprint() const;
+  // 本地端点地址（IPv4/IPv6 文本）；用于让对端知道“它连的是本机哪个地址”。
+  std::string local_address() const;
 
   bool send_all(const void* data, std::size_t length);
   // 分散写：一次系统调用按序发出多段缓冲（最多 3 段），避免把帧头和载荷

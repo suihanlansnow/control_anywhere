@@ -32,6 +32,8 @@ class Connection {
   }
 
   bool alive() const { return socket_.valid(); }
+  // 本端地址，用于中继把“主控端实际连接到的地址”下发给主控端。
+  std::string local_address() const { return socket_.local_address(); }
   void close() { socket_.close(); }
   void set_recv_timeout_ms(int milliseconds) {
     socket_.set_recv_timeout_ms(milliseconds);

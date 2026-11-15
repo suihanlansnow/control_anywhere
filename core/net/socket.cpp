@@ -271,6 +271,30 @@ std::string TcpSocket::tls_peer_fingerprint() const {
   return tls_ ? tls_->fingerprint : std::string();
 }
 
+std::string TcpSocket::local_address() const {
+  if (fd_ == -1) return {};
+  sockaddr_storage addr{};
+#ifdef _WIN32
+  int length = sizeof(addr);
+#else
+  socklen_t length = sizeof(addr);
+#endif
+  if (::getsockname(to_native(fd_), reinterpret_cast<sockaddr*>(&addr), &length) != 0) {
+    return {};
+  }
+  char text[64] = {0};
+  if (addr.ss_family == AF_INET) {
+    const auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr);
+    if (!::inet_ntop(AF_INET, &v4->sin_addr, text, sizeof(text))) return {};
+  } else if (addr.ss_family == AF_INET6) {
+    const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+    if (!::inet_ntop(AF_INET6, &v6->sin6_addr, text, sizeof(text))) return {};
+  } else {
+    return {};
+  }
+  return text;
+}
+
 bool TcpSocket::start_tls_server(const std::string& cert_path,
                                  const std::string& key_path, std::string* error) {
 #if !RC_ENABLE_TLS

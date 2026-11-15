@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -40,10 +41,16 @@ struct Session {
   std::shared_ptr<Peer> controller;
 };
 
+// 已下发邀请、等待被控端接受/拒绝的会话（有时限，避免主控端断线后残留）。
+struct PendingSession {
+  std::shared_ptr<Peer> controller;
+  uint64_t created_ms = 0;
+};
+
 std::mutex g_mutex;
 std::map<std::string, std::shared_ptr<Peer>> g_devices;
 std::map<uint64_t, Session> g_sessions;
-std::map<uint64_t, std::shared_ptr<Peer>> g_pending;  // session_id -> controller
+std::map<uint64_t, PendingSession> g_pending;
 std::atomic<uint64_t> g_next_session{1000};
 // 启动参数指定，之后只读；随 RegisterAck 下发给被控端和主控端。
 std::vector<std::string> g_ice_servers;
@@ -54,8 +61,20 @@ std::string g_tls_key;
 std::map<std::string, std::string> g_device_keys;
 // 身份公钥库文件；为空表示只在内存中固定（进程重启后失效）。
 std::string g_device_db_path = "relay-devices.json";
+// 下发给主控端的中继地址；为空时用主控端实际连接到的本机地址。
+std::string g_advertise_host;
+// 邀请等待被控端响应的默认超时，可用 --session-ttl 覆盖。
+constexpr uint64_t kDefaultPendingTtlMs = 60000;
+uint64_t g_pending_ttl_ms = kDefaultPendingTtlMs;
 
 json::Value object() { return json::Value::make_object(); }
+
+uint64_t monotonic_ms() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
 
 std::string random_nonce() {
   std::random_device device;
@@ -329,7 +348,7 @@ void handle_connect(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame
   const uint64_t session_id = g_next_session.fetch_add(1);
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_pending[session_id] = peer;
+    g_pending[session_id] = PendingSession{peer, monotonic_ms()};
   }
 
   json::Value invite = object();
@@ -348,11 +367,13 @@ void handle_connect(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame
 void handle_accept(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame) {
   const uint64_t session_id = frame.session_id;
   std::shared_ptr<Peer> controller;
+  bool expired = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_pending.find(session_id);
     if (it != g_pending.end()) {
-      controller = it->second;
+      expired = monotonic_ms() - it->second.created_ms >= g_pending_ttl_ms;
+      if (!expired) controller = it->second.controller;
       g_pending.erase(it);
     }
     if (controller) {
@@ -363,6 +384,15 @@ void handle_accept(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame)
     }
   }
 
+  if (expired) {
+    // 邀请已过期但被控端此时才接受：直接告诉被控端会话无效，不再通知主控端。
+    json::Value response = object();
+    response.set("ok", false);
+    response.set("reason", "session_expired");
+    peer->conn->send_json(MsgType::ConnectRsp, session_id, response);
+    RC_LOGW("relay", "accept for expired session " << session_id);
+    return;
+  }
   if (!controller) {
     RC_LOGW("relay", "accept for unknown session " << session_id);
     return;
@@ -372,12 +402,17 @@ void handle_accept(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame)
   response.set("ok", true);
   response.set("session_id", static_cast<int64_t>(session_id));
   json::Value relay_info = object();
-  relay_info.set("host", "127.0.0.1");
+  // 优先使用显式配置的对外地址；否则回填主控端实际连接到的本机地址，
+  // 避免多网卡/局域网部署时下发 127.0.0.1 导致后续连接失败。
+  std::string relay_host = g_advertise_host;
+  if (relay_host.empty()) relay_host = controller->conn->local_address();
+  if (relay_host.empty()) relay_host = "127.0.0.1";
+  relay_info.set("host", relay_host);
   relay_info.set("media_port", static_cast<int64_t>(kDefaultMediaPort));
   response.set("relay", relay_info);
   response.set("expire", 3600);
   controller->conn->send_json(MsgType::ConnectRsp, session_id, response);
-  RC_LOGI("relay", "session " << session_id << " accepted");
+  RC_LOGI("relay", "session " << session_id << " accepted, relay host " << relay_host);
 }
 
 void handle_reject(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame) {
@@ -387,7 +422,7 @@ void handle_reject(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame)
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_pending.find(session_id);
     if (it != g_pending.end()) {
-      controller = it->second;
+      controller = it->second.controller;
       g_pending.erase(it);
     }
   }
@@ -403,6 +438,37 @@ void handle_reject(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame)
   response.set("reason", reason);
   controller->conn->send_json(MsgType::ConnectRsp, session_id, response);
   RC_LOGI("relay", "session " << session_id << " rejected by host");
+}
+
+// 清理超过 kPendingTtlMs 仍未被被控端响应的邀请，并通知主控端超时。
+void sweep_pending_sessions() {
+  struct Expired {
+    std::shared_ptr<Connection> conn;
+    uint64_t session_id;
+  };
+  std::vector<Expired> expired;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const uint64_t now = monotonic_ms();
+    for (auto it = g_pending.begin(); it != g_pending.end();) {
+      if (now - it->second.created_ms < g_pending_ttl_ms) {
+        ++it;
+        continue;
+      }
+      expired.push_back({it->second.controller->conn, it->first});
+      it = g_pending.erase(it);
+    }
+  }
+
+  for (const Expired& item : expired) {
+    json::Value response = object();
+    response.set("ok", false);
+    response.set("reason", "session_expired");
+    item.conn->send_json(MsgType::ConnectRsp, item.session_id, response);
+  }
+  if (!expired.empty()) {
+    RC_LOGW("relay", "expired " << expired.size() << " pending session(s)");
+  }
 }
 
 void forward_session_frame(const std::shared_ptr<Peer>& peer, const DecodedFrame& frame) {
@@ -445,7 +511,7 @@ void cleanup(const std::shared_ptr<Peer>& peer) {
     }
 
     for (auto it = g_pending.begin(); it != g_pending.end();) {
-      if (it->second.get() == peer.get()) {
+      if (it->second.controller.get() == peer.get()) {
         it = g_pending.erase(it);
       } else {
         ++it;
@@ -548,6 +614,11 @@ int main(int argc, char** argv) {
       g_tls_key = argv[++i];
     } else if (arg == "--device-db" && has_next) {
       g_device_db_path = argv[++i];
+    } else if (arg == "--advertise-host" && has_next) {
+      g_advertise_host = argv[++i];
+    } else if (arg == "--session-ttl" && has_next) {
+      const int seconds = std::atoi(argv[++i]);
+      g_pending_ttl_ms = static_cast<uint64_t>(seconds < 5 ? 5 : seconds) * 1000;
     } else if (arg == "--no-device-db") {
       g_device_db_path.clear();
     } else {
@@ -555,7 +626,8 @@ int main(int argc, char** argv) {
                    "usage: %s [--port N] [--stun host:port] "
                    "[--turn [user:pass@]host:port]\n"
                    "       [--tls-cert relay.pem --tls-key relay-key.pem]\n"
-                   "       [--device-db relay-devices.json | --no-device-db]\n",
+                   "       [--device-db relay-devices.json | --no-device-db]\n"
+                   "       [--advertise-host <对外地址>] [--session-ttl 60]\n",
                    argv[0]);
       return 2;
     }
@@ -577,6 +649,13 @@ int main(int argc, char** argv) {
 
   RC_LOGI("relay", "listening on tcp/" << port
                                    << (g_tls_cert.empty() ? " (plaintext)" : " (TLS)"));
+  // 邀请超时清理线程：每 5 秒扫描一次待响应的会话。
+  std::thread([] {
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      sweep_pending_sessions();
+    }
+  }).detach();
   while (true) {
     TcpSocket socket = listener.accept();
     if (!socket.valid()) continue;
