@@ -5,6 +5,7 @@
 #include <d3d11.h>
 #include <emmintrin.h>
 #include <objbase.h>
+#include <oleauto.h>
 
 #include <cstdlib>
 
@@ -339,6 +340,9 @@ bool H264MfEncoder::configure(int width, int height, int fps, int quality,
     if (error) *error = "SetInputType(nv12) failed " + hr_text(hr);
     return false;
   }
+
+  // 强制关键帧走可选接口 ICodecAPI；不支持时请求会被拒绝并回落到等下一个 IDR。
+  if (FAILED(transform_.As(&codec_api_))) codec_api_.Reset();
 
   // 直通需要 MFT 认可的样本分配器；建不出来就退回 CPU 帧（不冒险送裸纹理）。
   if (texture_input_) {
@@ -691,6 +695,35 @@ bool H264MfEncoder::accept_input(IMFSample* prepared, std::string* error) {
   return true;
 }
 
+bool H264MfEncoder::request_keyframe() {
+  if (!transform_ || keyframe_unsupported_) return false;
+  keyframe_requested_.store(true);
+  return true;
+}
+
+void H264MfEncoder::apply_pending_keyframe() {
+  if (!keyframe_requested_.exchange(false)) return;
+  if (!codec_api_) {
+    if (!keyframe_unsupported_) {
+      keyframe_unsupported_ = true;
+      RC_LOGW("codec", "encoder has no ICodecAPI, keyframe request ignored");
+    }
+    return;
+  }
+  VARIANT value;
+  VariantInit(&value);
+  value.vt = VT_UI4;
+  value.ulVal = 1;
+  const HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value);
+  VariantClear(&value);
+  if (FAILED(hr)) {
+    keyframe_unsupported_ = true;
+    RC_LOGW("codec", "force keyframe rejected " << hr_text(hr));
+    return;
+  }
+  RC_LOGI("codec", "forced IDR on next frame");
+}
+
 bool H264MfEncoder::renegotiate(std::string* error) {
   Microsoft::WRL::ComPtr<IMFMediaType> type;
   if (FAILED(transform_->GetOutputAvailableType(0, 0, type.GetAddressOf()))) {
@@ -858,6 +891,8 @@ bool H264MfEncoder::encode(const CapturedFrame& source, EncodedFrame& out,
   bool produced = produce_output(out, kOutputPollMs, nullptr);
   // 取回一帧输出，说明最早的那份输入样本已经用完，可以还给分配器。
   if (produced && !held_samples_.empty()) held_samples_.pop_front();
+  // 关键帧请求必须在 ProcessInput 之前设置才会作用于这一帧。
+  apply_pending_keyframe();
   const uint64_t t_input = now_us();
   if (!accept_input(gpu_sample.Get(), error)) {
     // 输入没被接收：把已回收的帧交出去，别丢。
@@ -907,6 +942,9 @@ void H264MfEncoder::close() {
   held_peak_ = 0;
   sample_allocator_.Reset();
   input_type_.Reset();
+  codec_api_.Reset();
+  keyframe_requested_.store(false);
+  keyframe_unsupported_ = false;
   if (device_manager_ && device_handle_ != nullptr) {
     device_manager_->CloseDeviceHandle(device_handle_);
   }

@@ -72,8 +72,28 @@ cd apps/android
 ### 1. 启动中继
 
 ```bash
+# 明文 TCP（内网/本机自测）
 rc-relay --port 21116
+
+# TLS 加密（推荐公网部署；--tls-cert/--tls-key 为 PEM 文件）
+rc-relay --port 21116 --tls-cert relay.pem --tls-key relay-key.pem
 ```
+
+启用 TLS 后，被控端与主控端都要加 `--tls`，并用以下三种方式之一校验证书：
+
+```bash
+# 1) 固定证书 SHA-256 指纹（自签证书最常见）
+rc-cli host ... --tls --tls-fingerprint 9a74fece...25e13
+# 2) 提供 CA 证书链
+rc-cli host ... --tls --tls-ca ca.pem
+# 3) 仅加密、不校验（只建议本机/测试）
+rc-cli host ... --tls --tls-insecure
+```
+
+Qt 端在「网络」页勾选「TLS 加密」并填入中继证书指纹即可（留空表示仅加密不校验）。
+指纹为中继证书 DER 的 SHA-256 小写十六进制，可从中继日志或客户端首次连接日志中获取。
+
+自签证书可用 mbed TLS 自带的 `gen_key` / `cert_write` 生成，或使用任意标准 X.509 工具。
 
 ### 2. Windows / Ubuntu 桌面端
 
@@ -106,9 +126,15 @@ rc-relay --port 21116
 
 ```bash
 rc-web --http-port 8080 --relay 127.0.0.1:21116
-# 浏览器打开 http://<本机IP>:8080/，在页面中填写中继地址、被控端设备 ID、密码后连接
+# 启动日志会打印带令牌的地址，例如：
+#   网页控制台 http://127.0.0.1:8080/?token=3f2a...
+# 浏览器首次打开该地址后写入 HttpOnly Cookie，后续页面/流/接口自动携带认证。
 ```
 
+> 默认只监听 `127.0.0.1`；需要局域网访问时显式加 `--listen 0.0.0.0`。
+> `--token <令牌>` 可固定访问令牌；省略时每次启动随机生成。
+> 除 `/?token=` 首次换取 Cookie 外，所有页面、MJPEG 流与 `/api/*` 接口都需要有效令牌，
+> 未授权请求返回 `401`。
 > `--target` / `--password` 可选；不传时网关照常启动，等待浏览器提交被控端信息。
 > 页面右上角「切换设备」会先断开会话，再回到填写页。
 > 相关接口：`POST /api/connect {relay,target,password}`、`POST /api/disconnect`。
@@ -138,16 +164,21 @@ rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
 | 16 | `u32 seq` | 序列号 |
 | 20 | `u32 payload_len` | 载荷长度（≤1MiB） |
 
-主要消息类型：`Register 0x03`、`ConnectReq 0x05`、`ConnectRsp 0x06`、`Heartbeat 0x0A`、`AuthChallenge 0x13`、`AuthResponse 0x14`、`AuthResult 0x15`、`SessionClose 0x16`、`MouseMove 0x20`、`MouseButton 0x21`、`MouseWheel 0x22`、`Key 0x23`、`VideoFrame 0x31`。
+主要消息类型：`Register 0x03`、`ConnectReq 0x05`、`ConnectRsp 0x06`、`Heartbeat 0x0A`、`AuthChallenge 0x13`、`AuthResponse 0x14`、`AuthResult 0x15`、`SessionClose 0x16`、`CapsNegotiate 0x18`、`MouseMove 0x20`、`MouseButton 0x21`、`MouseWheel 0x22`、`Key 0x23`、`VideoConfig 0x30`、`VideoFrame 0x31`、`KeyframeReq 0x32`、`VideoStats 0x33`、`ClipboardSet 0x50`、`ClipboardData 0x51`、`FileOffer 0x52`、`FileAccept 0x53`、`FileChunk 0x54`、`FileEnd 0x55`、`FileAbort 0x56`。
 
 视频载荷头 32 字节：`capture_ts_us@0`、`encode_ts_us@8`、`frame_id@16`、`width u16@20`、`height u16@22`、`codec u8@24`（1=H.264）、`keyframe@25`、`data_len u32@28`，随后为 Annex-B H.264 数据。
 
 ## 核心特性
 
-- **复用单通道**：视频与输入走同一 TCP 会话，中继按 `session_id` 转发。
+- **复用单通道**：视频、输入、剪贴板与文件默认走同一 TCP 会话，中继按 `session_id` 转发。
+- **能力协商**：`CapsNegotiate` 收敛编码器、帧率与质量；`VideoConfig` 下发参数；`KeyframeReq` 强制 IDR；`VideoStats` 每秒回传编码统计。
 - **HMAC-SHA256 鉴权**：中继下发挑战，被控端用密码生成 proof，主控端回传验证。
+- **可选 TLS**：中继与两端之间支持 mbed TLS 加密，可用 CA、证书指纹或显式不安全模式校验。
 - **跨平台采集**：Windows DXGI；Linux X11 或 PipeWire（xdg-desktop-portal）。
 - **跨平台注入**：Windows `SendInput`；Linux `/dev/uinput`（支持 Wayland 与 X11）。
+- **双向文本剪贴板**：默认关闭，开启后按 500ms 轮询同步，带回环抑制与 256 KiB 上限。
+- **文件传输**：主控端可向被控端发送文件（64 KiB 分块、SHA 无关的大小校验），被控端默认关闭接收。
+- **Web 网关鉴权**：默认仅监听回环地址，令牌换取 HttpOnly Cookie，页面/MJPEG/API 均需认证。
 - **硬件解码**：Android 用 MediaCodec 解码到 Surface，零拷贝上屏。
 - **Web 网关节能**：无观看者时降到 2fps，无活动 15 秒后暂停会话；静止帧复用 JPEG 跳过编码。
 
@@ -156,6 +187,9 @@ rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
 - 键盘按 Qt 键码传递，暂不支持输入法组合文本（中文等 IME 候选）。
 - Android 客户端暂无文本输入协议，中文输入需依赖被控端已有输入法。
 - 多显示器切换、远程分辨率变化后的坐标范围自动刷新尚未实现。
+- 音频通道尚未实现（Qt 的音频开关仅做持久化）。
+- JPEG 编码路径缺少桌面端解码器，实际互通只使用 H.264。
+- 文件传输为单向（主控→被控）、自动接受，无断点续传、进度条与取消按钮。
 - Linux 输入注入依赖 `/dev/uinput` 权限，需配置 udev 规则。
 
 ## 文档

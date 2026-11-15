@@ -50,7 +50,9 @@ messages:
       fields: [session_id, password_proof, device_sig] }
   - { code: 0x15, name: AUTH_RESULT,      dir: host->controller, encoding: json, fields: [ok, reason] }
   - { code: 0x16, name: SESSION_CLOSE,    dir: both, encoding: json, fields: [session_id, reason] }
-  - { code: 0x18, name: CAPS_NEGOTIATE,   dir: both, encoding: json, fields: [codec, max_fps, max_width, quality] }
+  # codec / max_fps / quality / features 已生效；max_width 预留给分辨率缩放（尚未实现）。
+  - { code: 0x18, name: CAPS_NEGOTIATE,   dir: both, encoding: json,
+      fields: [codec, max_fps, max_width, quality, features, width, height, fps] }
 
   - { code: 0x20, name: INPUT_MOUSE_MOVE,   dir: controller->host, encoding: binary,
       layout: [ts_ms:u32, x:u16, y:u16, display_id:u8, reserved:u8] }
@@ -63,20 +65,31 @@ messages:
   - { code: 0x24, name: INPUT_TEXT,         dir: controller->host, encoding: utf8 }
   - { code: 0x26, name: INPUT_GESTURE,      dir: controller->host, encoding: json }
 
-  - { code: 0x30, name: VIDEO_CONFIG,       dir: host->controller, encoding: json }
+  - { code: 0x30, name: VIDEO_CONFIG,       dir: host->controller, encoding: json,
+      fields: [codec, width, height, fps, quality, bitrate_kbps, keyframe_interval, transport] }
   - { code: 0x31, name: VIDEO_FRAME,        dir: host->controller, encoding: binary,
       layout: [capture_ts_us:u64, encode_ts_us:u64, frame_id:u32, width:u16, height:u16,
                codec:u8, frame_flags:u8, reserved:u16, data_len:u32, data:bytes] }
-  - { code: 0x32, name: KEYFRAME_REQ,       dir: controller->host, encoding: json }
-  - { code: 0x33, name: VIDEO_STATS,        dir: controller->host, encoding: json }
+  - { code: 0x32, name: KEYFRAME_REQ,       dir: controller->host, encoding: json,
+      fields: [reason] }
+  # 发送端周期性上报，主控端据此显示实际带宽、帧率与编码耗时。
+  - { code: 0x33, name: VIDEO_STATS,        dir: host->controller, encoding: json,
+      fields: [frames_sent, bytes_sent, fps, bitrate_kbps, captured, dropped, encode_ms, transport] }
 
-  - { code: 0x50, name: CLIPBOARD_SET,      dir: both, encoding: json }
+  # 文本剪贴板：先发 SET 声明长度，再发 DATA（原始 UTF-8，上限 256 KiB）。
+  - { code: 0x50, name: CLIPBOARD_SET,      dir: both, encoding: json, fields: [format, size] }
   - { code: 0x51, name: CLIPBOARD_DATA,     dir: both, encoding: binary }
-  - { code: 0x52, name: FILE_OFFER,         dir: both, encoding: json }
-  - { code: 0x53, name: FILE_ACCEPT,        dir: both, encoding: json }
-  - { code: 0x54, name: FILE_CHUNK,         dir: both, encoding: binary }
-  - { code: 0x55, name: FILE_END,           dir: both, encoding: json }
-  - { code: 0x56, name: FILE_ABORT,         dir: both, encoding: json }
+  - { code: 0x52, name: FILE_OFFER,         dir: controller->host, encoding: json,
+      fields: [transfer_id, name, size] }
+  - { code: 0x53, name: FILE_ACCEPT,        dir: host->controller, encoding: json,
+      fields: [transfer_id, accept, reason] }
+  # 单块上限 64 KiB；offset 为文件内绝对偏移，接收端按 offset 顺序落盘。
+  - { code: 0x54, name: FILE_CHUNK,         dir: controller->host, encoding: binary,
+      layout: [transfer_id:u32, offset:u64, data:bytes] }
+  - { code: 0x55, name: FILE_END,           dir: controller->host, encoding: json,
+      fields: [transfer_id] }
+  - { code: 0x56, name: FILE_ABORT,         dir: both, encoding: json,
+      fields: [transfer_id, reason] }
 
   - { code: 0x61, name: ERROR,              dir: both, encoding: json, fields: [code, message] }
 

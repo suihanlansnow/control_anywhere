@@ -26,11 +26,13 @@ set(RC_CORE_SOURCES
   core/session/runner.cpp
   core/capture/capture_factory.cpp
   core/codec/codec_factory.cpp
+  core/transfer/file_transfer.cpp
 )
 
 if(WIN32)
   list(APPEND RC_CORE_SOURCES
     core/capture/dxgi_capture.cpp
+    core/clipboard/clipboard_win.cpp
     core/input/windows_input_injector.cpp
     core/codec/jpeg_encoder.cpp
     core/codec/h264_mf_encoder.cpp
@@ -53,6 +55,7 @@ if(UNIX AND NOT APPLE)
 
   list(APPEND RC_CORE_SOURCES
     core/capture/x11_capture.cpp
+    core/clipboard/clipboard_linux.cpp
     core/input/linux_input_injector.cpp
     core/codec/ffmpeg_jpeg_encoder.cpp
     core/codec/ffmpeg_h264_encoder.cpp
@@ -126,6 +129,37 @@ if(UNIX AND NOT APPLE)
       ${LIBPORTAL_LIBRARY_DIRS})
     target_compile_definitions(rc_core PUBLIC HAVE_PIPEWIRE_CAPTURE=1)
   endif()
+endif()
+
+# 控制通道 TLS（中继 <-> 被控端/主控端）：mbed TLS 可选依赖。
+# 关闭后仍可用明文 TCP，但公网部署不建议。
+option(RC_ENABLE_TLS "Enable TLS for relay control channel (mbed TLS)" ON)
+if(RC_ENABLE_TLS)
+  if(WIN32)
+    set(RC_MBEDTLS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls-install")
+    if(NOT EXISTS "${RC_MBEDTLS_ROOT}/include/mbedtls/ssl.h")
+      message(FATAL_ERROR "缺少 third_party/mbedtls-install（可用 -DRC_ENABLE_TLS=OFF 禁用）")
+    endif()
+    target_include_directories(rc_core PUBLIC "${RC_MBEDTLS_ROOT}/include")
+    target_link_libraries(rc_core PUBLIC
+      "${RC_MBEDTLS_ROOT}/lib/mbedtls.lib"
+      "${RC_MBEDTLS_ROOT}/lib/mbedx509.lib"
+      "${RC_MBEDTLS_ROOT}/lib/mbedcrypto.lib"
+      "${RC_MBEDTLS_ROOT}/lib/everest.lib"
+      "${RC_MBEDTLS_ROOT}/lib/p256m.lib"
+      bcrypt)
+  else()
+    pkg_check_modules(MBEDTLS mbedtls)
+    if(NOT MBEDTLS_FOUND)
+      message(FATAL_ERROR "未找到 mbedtls（可用 -DRC_ENABLE_TLS=OFF 禁用）")
+    endif()
+    target_include_directories(rc_core PUBLIC ${MBEDTLS_INCLUDE_DIRS})
+    target_link_libraries(rc_core PUBLIC ${MBEDTLS_LIBRARIES})
+    target_link_directories(rc_core PUBLIC ${MBEDTLS_LIBRARY_DIRS})
+  endif()
+  target_compile_definitions(rc_core PUBLIC RC_ENABLE_TLS=1)
+else()
+  target_compile_definitions(rc_core PUBLIC RC_ENABLE_TLS=0)
 endif()
 
 add_executable(rc-relay server/relay/main.cpp)

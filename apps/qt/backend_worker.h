@@ -21,6 +21,8 @@ class BackendWorker : public QObject {
 
   // 从 UI 线程直接调用，仅写入有界队列，不阻塞画面接收线程。
   void sendInput(const rc::InputEvent& event);
+  // 线程安全：把本地文件加入主控端的待发送队列。
+  void sendFile(const QString& path);
 
  public slots:
   void startHost(const rc::SessionConfig& cfg);

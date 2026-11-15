@@ -24,6 +24,17 @@ struct SessionConfig {
   std::vector<std::string> ice_servers;
   bool ice_force_relay = false;  // 只走 TURN
   bool ice_tcp = false;          // 允许 ICE over TCP 候选
+  // 双向同步纯文本剪贴板（默认关闭，需主控端权限页显式开启）。
+  bool clipboard = false;
+  // 允许接收对端发送的文件（默认关闭，文件落到 Downloads/rc-recv）。
+  bool file_transfer = false;
+  // 与中继之间启用 TLS。证书校验三选一：ca 文件、SHA-256 指纹、或显式不安全模式。
+  bool tls = false;
+  std::string tls_ca;
+  std::string tls_fingerprint;
+  // 证书主机名；留空时按 "relay" 校验（自签证书通常配指纹固定）。
+  std::string tls_server_name;
+  bool tls_insecure = false;
   int fps = 60;
   int quality = 75;
   int monitor = 0;

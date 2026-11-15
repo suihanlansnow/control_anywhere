@@ -39,6 +39,7 @@ class MainWindow : public QMainWindow {
   void onStopHost();
   void onStartClient();
   void onStopClient();
+  void onSendFile();
   void onSaveSettings();
   void onCopyDeviceId();
   void onCopyHostPassword();
@@ -88,11 +89,14 @@ class MainWindow : public QMainWindow {
   // 连接远程设备
   QLineEdit* editRelayHost_ = nullptr;
   QSpinBox* spinRelayPort_ = nullptr;
+  QCheckBox* switchTls_ = nullptr;
+  QLineEdit* editTlsFingerprint_ = nullptr;
   QLineEdit* editTargetId_ = nullptr;
   QLineEdit* editConnectPassword_ = nullptr;
   QLabel* clientStatusLabel_ = nullptr;
   QPushButton* btnConnect_ = nullptr;
   QPushButton* btnDisconnect_ = nullptr;
+  QPushButton* btnSendFile_ = nullptr;
 
   QCheckBox* switchAutoBitrate_ = nullptr;
 

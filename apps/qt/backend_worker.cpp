@@ -102,6 +102,12 @@ void BackendWorker::sendInput(const rc::InputEvent& event) {
   if (client_) client_->send_input(event);
 }
 
+void BackendWorker::sendFile(const QString& path) {
+  if (path.isEmpty()) return;
+  std::lock_guard<std::mutex> lock(runner_mutex_);
+  if (client_) client_->queue_file(path.toStdString());
+}
+
 void BackendWorker::stop() {
   stopping_.store(true);
   std::lock_guard<std::mutex> lock(runner_mutex_);

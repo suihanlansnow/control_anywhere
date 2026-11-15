@@ -30,6 +30,8 @@ static constexpr const char* kPlatformName = "Linux";
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDesktopServices>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -698,6 +700,16 @@ QWidget* MainWindow::buildConnectPanel() {
     relayRow->addLayout(portCol);
     vbox->addLayout(relayRow);
 
+    auto* tlsRow = new QHBoxLayout();
+    tlsRow->setSpacing(10);
+    switchTls_ = new QCheckBox(tr("TLS 加密"));
+    editTlsFingerprint_ = new QLineEdit();
+    editTlsFingerprint_->setPlaceholderText(
+        tr("中继证书 SHA-256 指纹（留空则仅加密、不校验证书）"));
+    tlsRow->addWidget(switchTls_);
+    tlsRow->addWidget(editTlsFingerprint_, 1);
+    vbox->addLayout(tlsRow);
+
     vbox->addSpacing(4);
     auto* lblTarget = new QLabel(tr("被控端设备 ID"));
     lblTarget->setObjectName("FieldLabel");
@@ -722,10 +734,13 @@ QWidget* MainWindow::buildConnectPanel() {
     btnConnect_->setObjectName("BtnPrimary");
     btnDisconnect_ = new QPushButton(tr("断开"));
     btnDisconnect_->setObjectName("BtnGhost");
+    btnSendFile_ = new QPushButton(tr("发送文件…"));
+    btnSendFile_->setObjectName("BtnGhost");
     clientStatusLabel_ = new QLabel(tr("未连接"));
     clientStatusLabel_->setObjectName("FieldHint");
     clientStatusLabel_->setWordWrap(true);
     btnRow->addWidget(btnConnect_);
+    btnRow->addWidget(btnSendFile_);
     btnRow->addWidget(btnDisconnect_);
     btnRow->addStretch();
     vbox->addLayout(btnRow);
@@ -738,6 +753,7 @@ QWidget* MainWindow::buildConnectPanel() {
   connect(btnHostStop_, &QPushButton::clicked, this, &MainWindow::onStopHost);
   connect(btnConnect_, &QPushButton::clicked, this, &MainWindow::onStartClient);
   connect(btnDisconnect_, &QPushButton::clicked, this, &MainWindow::onStopClient);
+  connect(btnSendFile_, &QPushButton::clicked, this, &MainWindow::onSendFile);
   connect(editConnectPassword_, &QLineEdit::returnPressed, this,
           &MainWindow::onStartClient);
   return panel;
@@ -1215,6 +1231,12 @@ void MainWindow::onStartHost() {
       editIceServers_ ? split_ice_servers(editIceServers_->text())
                       : std::vector<std::string>();
   cfg.ice_force_relay = switchIceRelayOnly_ && switchIceRelayOnly_->isChecked();
+  cfg.clipboard = switchClipboard_ && switchClipboard_->isChecked();
+  cfg.file_transfer = switchFileTransfer_ && switchFileTransfer_->isChecked();
+  cfg.tls = switchTls_ && switchTls_->isChecked();
+  cfg.tls_fingerprint = editTlsFingerprint_ ? editTlsFingerprint_->text().trimmed().toStdString()
+                                            : std::string();
+  cfg.tls_insecure = cfg.tls && cfg.tls_fingerprint.empty();
 
   hostState_ = "connecting";
   if (hostStatusLabel_) hostStatusLabel_->setText(tr("正在开启被控端…"));
@@ -1268,6 +1290,12 @@ void MainWindow::onStartClient() {
       editIceServers_ ? split_ice_servers(editIceServers_->text())
                       : std::vector<std::string>();
   cfg.ice_force_relay = switchIceRelayOnly_ && switchIceRelayOnly_->isChecked();
+  cfg.clipboard = switchClipboard_ && switchClipboard_->isChecked();
+  cfg.file_transfer = switchFileTransfer_ && switchFileTransfer_->isChecked();
+  cfg.tls = switchTls_ && switchTls_->isChecked();
+  cfg.tls_fingerprint = editTlsFingerprint_ ? editTlsFingerprint_->text().trimmed().toStdString()
+                                            : std::string();
+  cfg.tls_insecure = cfg.tls && cfg.tls_fingerprint.empty();
 
   if (clientWorker_ && switchAutoReconnect_) {
     clientWorker_->setAutoReconnect(switchAutoReconnect_->isChecked());
@@ -1290,6 +1318,17 @@ void MainWindow::onStopClient() {
   clientState_ = "closed";
   if (clientStatusLabel_) clientStatusLabel_->setText(tr("已断开远程连接"));
   updateStatusLabel();
+}
+
+void MainWindow::onSendFile() {
+  if (!clientWorker_ || clientState_ != "streaming") {
+    if (clientStatusLabel_) clientStatusLabel_->setText(tr("请先连接远程设备再发送文件"));
+    return;
+  }
+  const QString path = QFileDialog::getOpenFileName(this, tr("选择要发送的文件"));
+  if (path.isEmpty()) return;
+  clientWorker_->sendFile(path);
+  if (logView_) logView_->append(tr("正在发送文件：%1").arg(QFileInfo(path).fileName()));
 }
 
 void MainWindow::onCopyDeviceId() {
@@ -1456,6 +1495,9 @@ void MainWindow::saveSettings() {
   QSettings s;
   s.setValue("relay/host", editRelayHost_ ? editRelayHost_->text() : "");
   s.setValue("relay/port", spinRelayPort_ ? spinRelayPort_->value() : 21116);
+  s.setValue("relay/tls", switchTls_ ? switchTls_->isChecked() : false);
+  s.setValue("relay/tls_fingerprint",
+             editTlsFingerprint_ ? editTlsFingerprint_->text() : "");
   s.setValue("device/id", editDeviceId_ ? editDeviceId_->text() : "");
   s.setValue("security/password", editPassword_ ? editPassword_->text() : "");
   s.setValue("client/target", editTargetId_ ? editTargetId_->text() : "");
@@ -1479,6 +1521,10 @@ void MainWindow::saveSettings() {
 void MainWindow::loadSettings() {
   QSettings s;
   if (editRelayHost_) editRelayHost_->setText(s.value("relay/host", "127.0.0.1").toString());
+  if (switchTls_) switchTls_->setChecked(s.value("relay/tls", false).toBool());
+  if (editTlsFingerprint_) {
+    editTlsFingerprint_->setText(s.value("relay/tls_fingerprint", "").toString());
+  }
   if (spinRelayPort_) spinRelayPort_->setValue(s.value("relay/port", 21116).toInt());
   if (editDeviceId_) editDeviceId_->setText(s.value("device/id", "").toString());
   if (editPassword_) editPassword_->setText(s.value("security/password", "").toString());

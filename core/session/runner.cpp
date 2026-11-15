@@ -1,5 +1,8 @@
 #include "session/runner.h"
 
+#include "clipboard/clipboard.h"
+#include "transfer/file_transfer.h"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -69,6 +72,111 @@ static json::Value parse_payload_cfg(const DecodedFrame& frame) {
     return make_object();
   }
 }
+
+// 主控能力列表里优先保留被控端当前编码；对方不支持时退回 jpeg（两端都有实现）。
+static std::string pick_codec(const std::string& host_codec, const json::Value* codecs) {
+  if (!codecs || !codecs->is_array() || codecs->size() == 0) return host_codec;
+  for (std::size_t i = 0; i < codecs->size(); ++i) {
+    if (codecs->at(i).as_string() == host_codec) return host_codec;
+  }
+  for (std::size_t i = 0; i < codecs->size(); ++i) {
+    if (codecs->at(i).as_string() == "jpeg") return "jpeg";
+  }
+  for (std::size_t i = 0; i < codecs->size(); ++i) {
+    if (codecs->at(i).as_string() == "h264") return "h264";
+  }
+  return host_codec;
+}
+
+// 本端已实现的可协商特性；未实现的不会回执给主控端。
+static bool feature_supported(const std::string& name) {
+  return name == "keyframe-request" || name == "video-stats";
+}
+
+// 本机剪贴板与对端做纯文本同步：轮询本机变化后发送；写入远端文本后短暂静默，
+// 避免 watcher 把刚写进去的内容再发回对端形成回环。
+class ClipboardBridge {
+ public:
+  using SendCallback = std::function<bool(const std::string&)>;
+  using LogFn = std::function<void(const std::string& level, const std::string& msg)>;
+
+  ClipboardBridge(SendCallback send, LogFn log) : send_(std::move(send)), log_(std::move(log)) {
+    std::string error;
+    clipboard_ = create_clipboard(&error);
+    if (!clipboard_ && log_) log_("WARN", "clipboard unavailable: " + error);
+  }
+  ~ClipboardBridge() { stop(); }
+
+  void start() {
+    if (!clipboard_ || thread_.joinable()) return;
+    stop_.store(false);
+    thread_ = std::thread([this] { run(); });
+  }
+
+  void stop() {
+    stop_.store(true);
+    if (thread_.joinable()) thread_.join();
+  }
+
+  // 收到远端文本：写本机剪贴板并记录，避免被 watcher 原样发回去。
+  void apply_remote(const std::string& text) {
+    if (!clipboard_) return;
+    if (text.size() > kMaxBytes) {
+      if (log_) log_("WARN", "clipboard ignored: " + std::to_string(text.size()) + " bytes");
+      return;
+    }
+    std::string error;
+    if (!clipboard_->write_text(text, &error)) {
+      if (log_) log_("WARN", "clipboard write failed: " + error);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      last_seen_ = text;
+      // 轮询与写入之间可能读到旧内容，短暂静默避免把旧文本回传。
+      suppress_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+    }
+    if (log_) log_("INFO", "clipboard applied (" + std::to_string(text.size()) + " bytes)");
+  }
+
+ private:
+  void run() {
+    // 先记下当前内容，避免会话一开始就把历史剪贴板当成新内容发出去。
+    std::string initial;
+    if (clipboard_->read_text(initial, nullptr)) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      last_seen_ = initial;
+    }
+    while (!stop_.load()) {
+      for (int i = 0; i < 10 && !stop_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      if (stop_.load()) break;
+      std::string text;
+      if (!clipboard_->read_text(text, nullptr)) continue;
+      if (text.size() > kMaxBytes) continue;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (text == last_seen_) continue;
+        if (std::chrono::steady_clock::now() < suppress_until_) continue;
+        last_seen_ = text;
+      }
+      if (!send_(text)) break;
+      if (log_) log_("INFO", "clipboard sent (" + std::to_string(text.size()) + " bytes)");
+    }
+  }
+
+  // 单帧上限 1 MiB，留出 JSON 头部余量。
+  static constexpr std::size_t kMaxBytes = 256 * 1024;
+  SendCallback send_;
+  LogFn log_;
+  std::unique_ptr<Clipboard> clipboard_;
+  std::mutex mutex_;
+  std::string last_seen_;
+  std::chrono::steady_clock::time_point suppress_until_{};
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
 
 // 中继在 RegisterAck 里下发的 ICE 配置：{"ice":{"servers":["stun:...","turn:..."]}}。
 static std::vector<std::string> parse_ice_servers(const json::Value& ack) {
@@ -223,12 +331,16 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
     }
   }
 
+  // CapsNegotiate 已按主控能力收敛过；未协商时沿用本端配置。
+  const std::string codec = negotiated_codec_.empty() ? cfg_.codec : negotiated_codec_;
+  const int quality = negotiated_quality_ > 0 ? negotiated_quality_ : cfg_.quality;
+
   // B5: H.264 编码器直接吃 NV12，省掉 8MB 回读和 CPU 逐像素转换。
-  if (cfg_.codec == "h264" && !capture->set_output_format(PixelFormat::kNV12)) {
+  if (codec == "h264" && !capture->set_output_format(PixelFormat::kNV12)) {
     log_("INFO", "host", "capture cannot output nv12, using bgra");
   }
 
-  std::unique_ptr<IVideoEncoder> encoder = create_encoder(cfg_.codec, &error);
+  std::unique_ptr<IVideoEncoder> encoder = create_encoder(codec, &error);
   if (!encoder) {
     log_("ERROR", "host", "encoder unavailable: " + error);
     return 0;
@@ -249,7 +361,7 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
   int fps = cfg_.fps > 0 ? cfg_.fps : 60;
   const int requested_fps = requested_fps_.exchange(0);
   if (requested_fps > 0 && requested_fps < fps) fps = requested_fps;
-  if (!encoder->open(width, height, fps, cfg_.quality, &error)) {
+  if (!encoder->open(width, height, fps, quality, &error)) {
     log_("ERROR", "host", "encoder open failed: " + error);
     return 0;
   }
@@ -292,6 +404,9 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
   SendSlot send_slot;
   std::atomic<int> sent_count{0};
   std::atomic<uint64_t> sent_bytes{0};
+  // 每秒窗口内的编码耗时累计，VideoStats 取平均后清零。
+  std::atomic<int64_t> encode_us_sum{0};
+  std::atomic<int> encode_samples{0};
   std::atomic<bool> send_failed{false};
   std::atomic<bool> stream_closed{false};
   std::atomic<bool> control_stop{false};
@@ -388,6 +503,77 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
   (void)use_webrtc;
 #endif
 
+  // 会话建立后先下发编码参数：主控端据此显示实际分辨率/帧率，并在需要时请求关键帧。
+  std::string active_transport = "tcp";
+#ifdef RC_ENABLE_WEBRTC
+  if (rtc) active_transport = "webrtc";
+#endif
+  // 协商回执放在实际分辨率确定之后，主控端一次拿到最终编码参数。
+  if (caps_negotiated_) {
+    json::Value caps_reply = make_object();
+    caps_reply.set("codec", codec);
+    caps_reply.set("width", width);
+    caps_reply.set("height", height);
+    caps_reply.set("fps", fps);
+    caps_reply.set("quality", quality);
+    json::Value features = json::Value::make_array();
+    for (const std::string& name : negotiated_features_) features.push(name);
+    caps_reply.set("features", features);
+    if (!conn.send_json(MsgType::CapsNegotiate, session_id, caps_reply)) {
+      log_("WARN", "host", "send caps reply failed");
+    }
+  }
+
+  json::Value video_cfg = make_object();
+  video_cfg.set("codec", codec);
+  video_cfg.set("width", width);
+  video_cfg.set("height", height);
+  video_cfg.set("fps", fps);
+  video_cfg.set("quality", quality);
+  const int bitrate_kbps = encoder->target_bitrate_kbps();
+  if (bitrate_kbps > 0) video_cfg.set("bitrate_kbps", bitrate_kbps);
+  video_cfg.set("keyframe_interval", fps);
+  video_cfg.set("transport", active_transport);
+  if (conn.send_json(MsgType::VideoConfig, session_id, video_cfg)) {
+    log_("INFO", "host",
+         "video config: codec=" + codec + " " + std::to_string(width) + "x" +
+             std::to_string(height) + " fps=" + std::to_string(fps) + " quality=" +
+             std::to_string(quality) +
+             (bitrate_kbps > 0 ? " bitrate=" + std::to_string(bitrate_kbps) + "kbps" : "") +
+             " transport=" + active_transport);
+  } else {
+    log_("WARN", "host", "send video config failed");
+  }
+
+  // 剪贴板同步默认关闭；开启后由 watcher 线程把本机变化推给主控端。
+  std::unique_ptr<ClipboardBridge> clipboard;
+  int pending_clipboard_size = -1;
+  if (cfg_.clipboard) {
+    clipboard = std::make_unique<ClipboardBridge>(
+        [&](const std::string& text) {
+          json::Value announce = make_object();
+          announce.set("format", "text");
+          announce.set("size", static_cast<int64_t>(text.size()));
+          if (!conn.send_json(MsgType::ClipboardSet, session_id, announce)) return false;
+          return conn.send(MsgType::ClipboardData, session_id,
+                           reinterpret_cast<const uint8_t*>(text.data()), text.size());
+        },
+        [&](const std::string& level, const std::string& msg) { log_(level, "clipboard", msg); });
+    clipboard->start();
+  }
+
+  // 文件接收：一次只处理一个传输，收到 FileOffer 后写入接收目录并回 FileAccept。
+  FileReceiver file_receiver;
+  uint32_t file_transfer_id = 0;
+  bool file_receiving = false;
+  auto send_file_accept = [&](uint32_t transfer_id, bool accept, const std::string& reason) {
+    json::Value msg = make_object();
+    msg.set("transfer_id", static_cast<int64_t>(transfer_id));
+    msg.set("accept", accept);
+    if (!reason.empty()) msg.set("reason", reason);
+    conn.send_json(MsgType::FileAccept, session_id, msg);
+  };
+
   // 推流期间也要接收控制消息，否则主控断开后中继发来的 SessionClose
   // 会一直堆在接收缓冲区，Host 无法结束旧会话或接受下一次连接。
   conn.set_recv_timeout_ms(200);
@@ -434,6 +620,107 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
         }
       }
 #endif
+      if (clipboard && (incoming.type == MsgType::ClipboardSet ||
+                        incoming.type == MsgType::ClipboardData)) {
+        if (incoming.type == MsgType::ClipboardSet) {
+          json::Value payload = parse_payload_cfg(incoming);
+          pending_clipboard_size = payload.get("size")
+                                       ? static_cast<int>(payload.get("size")->as_int(-1))
+                                       : -1;
+        } else {
+          if (pending_clipboard_size >= 0 &&
+              static_cast<int>(incoming.payload.size()) == pending_clipboard_size) {
+            clipboard->apply_remote(
+                std::string(incoming.payload.begin(), incoming.payload.end()));
+          }
+          pending_clipboard_size = -1;
+        }
+        continue;
+      }
+      if (incoming.type == MsgType::FileOffer) {
+        json::Value payload = parse_payload_cfg(incoming);
+        const uint32_t transfer_id =
+            payload.get("transfer_id")
+                ? static_cast<uint32_t>(payload.get("transfer_id")->as_int(0))
+                : 0;
+        const std::string name =
+            payload.get("name") ? payload.get("name")->as_string("file") : "file";
+        const uint64_t size =
+            payload.get("size") ? static_cast<uint64_t>(payload.get("size")->as_int(0)) : 0;
+        std::string error;
+        if (!cfg_.file_transfer) {
+          send_file_accept(transfer_id, false, "disabled");
+          log_("WARN", "file", "rejected incoming file (file transfer disabled)");
+        } else if (file_receiving) {
+          send_file_accept(transfer_id, false, "busy");
+        } else if (!file_receiver.begin(name, size, &error)) {
+          send_file_accept(transfer_id, false, error);
+          log_("WARN", "file", "cannot receive file: " + error);
+        } else {
+          file_transfer_id = transfer_id;
+          file_receiving = true;
+          send_file_accept(transfer_id, true, "");
+          log_("INFO", "file",
+               "receiving " + name + " (" + std::to_string(size) + " bytes) -> " +
+                   file_receiver.path());
+        }
+        continue;
+      }
+      if (incoming.type == MsgType::FileChunk) {
+        if (file_receiving && incoming.payload.size() > kFileChunkHeaderBytes) {
+          const uint32_t transfer_id = read_u32_le(incoming.payload.data());
+          const uint64_t offset = read_u64_le(incoming.payload.data() + 4);
+          if (transfer_id == file_transfer_id) {
+            std::string error;
+            if (!file_receiver.write(offset, incoming.payload.data() + kFileChunkHeaderBytes,
+                                     incoming.payload.size() - kFileChunkHeaderBytes, &error)) {
+              log_("WARN", "file", "write failed: " + error);
+              file_receiver.abort();
+              file_receiving = false;
+              json::Value abort_msg = make_object();
+              abort_msg.set("transfer_id", static_cast<int64_t>(transfer_id));
+              abort_msg.set("reason", error);
+              conn.send_json(MsgType::FileAbort, session_id, abort_msg);
+            }
+          }
+        }
+        continue;
+      }
+      if (incoming.type == MsgType::FileEnd) {
+        if (file_receiving) {
+          std::string error;
+          const std::string path = file_receiver.path();
+          const uint64_t size = file_receiver.expected_size();
+          if (file_receiver.finish(&error)) {
+            log_("INFO", "file",
+                 "file received: " + path + " (" + std::to_string(size) + " bytes)");
+          } else {
+            log_("WARN", "file", "file incomplete: " + error);
+          }
+          file_receiving = false;
+        }
+        continue;
+      }
+      if (incoming.type == MsgType::FileAbort) {
+        if (file_receiving) {
+          file_receiver.abort();
+          file_receiving = false;
+          log_("WARN", "file", "transfer aborted by controller");
+        }
+        continue;
+      }
+      if (incoming.type == MsgType::KeyframeReq) {
+        json::Value payload = parse_payload_cfg(incoming);
+        const std::string reason =
+            payload.get("reason") ? payload.get("reason")->as_string("controller")
+                                  : "controller";
+        if (encoder->request_keyframe()) {
+          log_("INFO", "host", "keyframe requested (" + reason + "), forcing next IDR");
+        } else {
+          log_("WARN", "host", "keyframe request ignored: encoder cannot force IDR");
+        }
+        continue;
+      }
 #if defined(__linux__) || defined(_WIN32)
       if (!input_enabled_.load()) {
         // 仅观看模式：消息照常消费，但不下发到注入器。
@@ -470,7 +757,50 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
 
   std::thread send_thread([&]() {
     auto last_heartbeat = std::chrono::steady_clock::now();
+    // 每秒上报一次累计计数与区间速率，主控端据此显示带宽/帧率/编码耗时。
+    auto last_stats = std::chrono::steady_clock::now();
+    int stats_frames = 0;
+    uint64_t stats_bytes = 0;
     while (true) {
+      {
+        const auto stats_now = std::chrono::steady_clock::now();
+        const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       stats_now - last_stats)
+                                       .count();
+        if (elapsed_ms >= 1000) {
+          const int frames_now = sent_count.load();
+          const int64_t bytes_now = static_cast<int64_t>(sent_bytes.load());
+          int captured_now = 0;
+          int dropped_now = 0;
+          {
+            std::lock_guard<std::mutex> lock(slot.mutex);
+            captured_now = slot.captured;
+            dropped_now = slot.overwritten;
+          }
+          const int samples = encode_samples.exchange(0);
+          const int64_t encode_us = encode_us_sum.exchange(0);
+          json::Value stats = make_object();
+          stats.set("frames_sent", frames_now);
+          stats.set("bytes_sent", bytes_now);
+          stats.set("fps", static_cast<int>((frames_now - stats_frames) * 1000 / elapsed_ms));
+          stats.set("bitrate_kbps",
+                    static_cast<int>((bytes_now - static_cast<int64_t>(stats_bytes)) * 8 /
+                                     elapsed_ms));
+          stats.set("captured", captured_now);
+          stats.set("dropped", dropped_now);
+          stats.set("encode_ms",
+                    samples > 0 ? static_cast<int>(encode_us / samples / 1000) : 0);
+          stats.set("transport", active_transport);
+          if (!conn.send_json(MsgType::VideoStats, session_id, stats)) {
+            log_("WARN", "host", "send video stats failed");
+            send_failed.store(true);
+            break;
+          }
+          last_stats = stats_now;
+          stats_frames = frames_now;
+          stats_bytes = static_cast<uint64_t>(bytes_now);
+        }
+      }
       SendTask task;
       bool has_task = false;
       {
@@ -570,10 +900,13 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
 
     EncodedFrame encoded;
     std::string enc_error;
+    const uint64_t encode_start_us = now_us();
     if (!encoder->encode(last_frame, encoded, &enc_error)) {
       log_("WARN", "host", "encode failed: " + enc_error);
       continue;
     }
+    encode_us_sum.fetch_add(static_cast<int64_t>(now_us() - encode_start_us));
+    encode_samples.fetch_add(1);
 
     // B3: 每次 encode 后同步 texture_output / device_manager，允许中途切换。
     device_manager.store(encoder->native_device_manager());
@@ -655,6 +988,19 @@ int HostRunner::run() {
     log_("ERROR", "host", "relay connect failed: " + error);
     return 2;
   }
+  if (cfg_.tls) {
+    std::string tls_error;
+    if (!socket.start_tls_client(cfg_.tls_server_name, cfg_.tls_ca,
+                                 cfg_.tls_fingerprint, cfg_.tls_insecure,
+                                 &tls_error)) {
+      log_("ERROR", "host", "relay TLS failed: " + tls_error);
+      return 2;
+    }
+    log_("INFO", "host", "relay TLS established" +
+                             (socket.tls_peer_fingerprint().empty()
+                                  ? std::string()
+                                  : ", cert sha256=" + socket.tls_peer_fingerprint()));
+  }
   log_("INFO", "host", "connected to relay " + cfg_.relay_host + ":" + std::to_string(cfg_.relay_port));
   if (status_cb_) status_cb_("connected");
 
@@ -703,6 +1049,10 @@ int HostRunner::run() {
         // 主控在 ConnectReq.want 里声明可接受的最高帧率，这里记录后按需降帧编码。
         requested_fps_.store(0);  // 本次邀请未声明时不能沿用上一会话的值
         requested_transport_.clear();
+        caps_negotiated_ = false;
+        negotiated_codec_.clear();
+        negotiated_quality_ = 0;
+        negotiated_features_.clear();
         if (const json::Value* want_field = payload.get("want")) {
           if (const json::Value* fps_field = want_field->get("max_fps")) {
             requested_fps_.store(static_cast<int>(fps_field->as_int(0)));
@@ -726,6 +1076,47 @@ int HostRunner::run() {
         guard.move_to(SessionState::Authing);
         log_("INFO", "host", "session " + std::to_string(session_id) + " invited by " + from);
         if (status_cb_) status_cb_("authing");
+        break;
+      }
+      case MsgType::CapsNegotiate: {
+        if (frame.session_id != session_id) break;
+        json::Value payload = parse_payload_cfg(frame);
+        caps_negotiated_ = true;
+        negotiated_codec_ = pick_codec(cfg_.codec, payload.get("codec"));
+        // WebRTC 视频轨只打包 H.264；协商到其它编码时退回 TCP，避免建出无法解码的会话。
+        if (requested_transport_ == "webrtc" && negotiated_codec_ != "h264") {
+          log_("WARN", "webrtc",
+               "caps negotiated codec=" + negotiated_codec_ + ", falling back to tcp");
+          requested_transport_ = "tcp";
+        }
+
+        // 主控能力只用于收敛，不会把本端配置抬高；最高帧率取双方较小值。
+        int fps = cfg_.fps > 0 ? cfg_.fps : 60;
+        if (const json::Value* field = payload.get("max_fps")) {
+          const int client_fps = static_cast<int>(field->as_int(0));
+          if (client_fps > 0 && client_fps < fps) fps = client_fps;
+        }
+        requested_fps_.store(fps);
+
+        int quality = cfg_.quality;
+        if (const json::Value* field = payload.get("quality")) {
+          const int client_quality = static_cast<int>(field->as_int(0));
+          if (client_quality > 0 && client_quality < quality) quality = client_quality;
+        }
+        negotiated_quality_ = quality;
+
+        negotiated_features_.clear();
+        const json::Value* features = payload.get("features");
+        if (features && features->is_array()) {
+          for (std::size_t i = 0; i < features->size(); ++i) {
+            const std::string name = features->at(i).as_string();
+            if (feature_supported(name)) negotiated_features_.push_back(name);
+          }
+        }
+        log_("INFO", "host",
+             "caps negotiate: codec=" + negotiated_codec_ + " fps=" + std::to_string(fps) +
+                 " quality=" + std::to_string(quality) + " features=" +
+                 std::to_string(negotiated_features_.size()));
         break;
       }
       case MsgType::AuthResponse: {
@@ -802,6 +1193,16 @@ void ClientRunner::stop() {
   stop_flag_.store(true);
   input_stop_.store(true);
   input_cv_.notify_all();
+  file_cv_.notify_all();
+}
+
+void ClientRunner::queue_file(const std::string& path) {
+  if (path.empty()) return;
+  {
+    std::lock_guard<std::mutex> lock(file_mutex_);
+    file_queue_.push_back(path);
+  }
+  file_cv_.notify_one();
 }
 
 void ClientRunner::send_input(const InputEvent& event) {
@@ -843,6 +1244,19 @@ int ClientRunner::run() {
     log_("ERROR", "ctrl", "relay connect failed: " + error);
     return 2;
   }
+  if (cfg_.tls) {
+    std::string tls_error;
+    if (!socket.start_tls_client(cfg_.tls_server_name, cfg_.tls_ca,
+                                 cfg_.tls_fingerprint, cfg_.tls_insecure,
+                                 &tls_error)) {
+      log_("ERROR", "ctrl", "relay TLS failed: " + tls_error);
+      return 2;
+    }
+    log_("INFO", "ctrl", "relay TLS established" +
+                             (socket.tls_peer_fingerprint().empty()
+                                  ? std::string()
+                                  : ", cert sha256=" + socket.tls_peer_fingerprint()));
+  }
   log_("INFO", "ctrl", "connected to relay " + cfg_.relay_host + ":" + std::to_string(cfg_.relay_port));
   if (status_cb_) status_cb_("connected");
 
@@ -876,6 +1290,41 @@ int ClientRunner::run() {
   std::vector<uint8_t> nonce;
   int frames_received = 0;
   uint64_t bytes_received = 0;
+
+  // 关键帧请求：会话建立时主动要一帧 IDR；解码失败时带 500ms 节流再要一次，
+  // 避免码流损坏导致每帧都发请求把控制通道打满。
+  std::atomic<uint64_t> keyframe_session{0};
+  std::atomic<int64_t> last_keyframe_req_ms{0};
+  // 剪贴板消息必须等会话建立后再发，鉴权前 watcher 只记录不发送。
+  std::atomic<uint64_t> clipboard_session{0};
+  int pending_clipboard_size = -1;
+  // 文件传输：会话建立后由独立线程按队列顺序发送，等待 FileAccept 有超时。
+  std::atomic<uint64_t> file_session{0};
+  std::mutex file_accept_mutex;
+  std::condition_variable file_accept_cv;
+  uint32_t pending_file_id = 0;
+  bool file_accept_ready = false;
+  bool file_accepted = false;
+  std::string file_accept_reason;
+  std::atomic<uint32_t> file_abort_id{0};
+  std::atomic<uint32_t> next_transfer_id{1};
+  // VideoStats 每秒到达，日志按 5s 取样，避免刷屏。
+  std::chrono::steady_clock::time_point last_stats_log{};
+  auto request_keyframe = [&](const char* reason) {
+    const uint64_t sid = keyframe_session.load();
+    if (sid == 0) return;
+    const int64_t now = static_cast<int64_t>(now_ms());
+    int64_t prev = last_keyframe_req_ms.load();
+    if (prev != 0 && now - prev < 500) return;
+    if (!last_keyframe_req_ms.compare_exchange_strong(prev, now)) return;
+    json::Value body = make_object();
+    body.set("reason", reason);
+    if (conn.send_json(MsgType::KeyframeReq, sid, body)) {
+      log_("INFO", "ctrl", std::string("requested keyframe (") + reason + ")");
+    } else {
+      log_("WARN", "ctrl", "send keyframe request failed");
+    }
+  };
 
   json::Value request = make_object();
   request.set("target_id", cfg_.target_id);
@@ -997,6 +1446,9 @@ int ClientRunner::run() {
             render_has_frame = true;
           }
         }
+      } else {
+        // 解码失败通常意味着丢了参考帧：立刻向被控端要一帧 IDR 重新同步。
+        request_keyframe("decode-failed");
       }
     }
   });
@@ -1085,6 +1537,144 @@ int ClientRunner::run() {
     }
   } input_joiner{&input_stop_, &input_cv_, &input_thread};
 
+  // 文件发送：一次一个文件，FileOffer → 等 FileAccept（10s）→ 64 KiB 分块 → FileEnd。
+  std::atomic<bool> file_stop{false};
+  std::thread file_thread([&]() {
+    while (!file_stop.load() && !stop_flag_.load()) {
+      std::string path;
+      {
+        std::unique_lock<std::mutex> lock(file_mutex_);
+        file_cv_.wait_for(lock, std::chrono::milliseconds(200), [&] {
+          return file_stop.load() || stop_flag_.load() || !file_queue_.empty();
+        });
+        if (file_stop.load() || stop_flag_.load()) break;
+        if (file_queue_.empty()) continue;
+        path = file_queue_.front();
+        file_queue_.pop_front();
+      }
+
+      FileSender sender;
+      std::string error;
+      if (!sender.open(path, &error)) {
+        log_("ERROR", "file", "cannot open " + path + ": " + error);
+        continue;
+      }
+      const uint64_t sid = file_session.load();
+      if (sid == 0) {
+        log_("WARN", "file", "session not ready, skip sending " + path);
+        continue;
+      }
+      const uint32_t transfer_id = next_transfer_id.fetch_add(1);
+      json::Value offer = make_object();
+      offer.set("transfer_id", static_cast<int64_t>(transfer_id));
+      offer.set("name", sender.name());
+      offer.set("size", static_cast<int64_t>(sender.size()));
+      {
+        std::lock_guard<std::mutex> lock(file_accept_mutex);
+        pending_file_id = transfer_id;
+        file_accept_ready = false;
+        file_accepted = false;
+        file_accept_reason.clear();
+      }
+      if (!conn.send_json(MsgType::FileOffer, sid, offer)) {
+        log_("WARN", "file", "send file offer failed");
+        continue;
+      }
+      log_("INFO", "file", "offering " + sender.name() + " (" +
+                                std::to_string(sender.size()) + " bytes)");
+      bool accepted = false;
+      std::string reason;
+      {
+        std::unique_lock<std::mutex> lock(file_accept_mutex);
+        const bool got = file_accept_cv.wait_for(lock, std::chrono::seconds(10), [&] {
+          return file_accept_ready || file_stop.load() || stop_flag_.load();
+        });
+        if (got && file_accept_ready) {
+          accepted = file_accepted;
+          reason = file_accept_reason;
+        } else if (!got) {
+          reason = "timeout";
+        }
+      }
+      if (!accepted) {
+        log_("WARN", "file", "transfer rejected: " + (reason.empty() ? "aborted" : reason));
+        continue;
+      }
+
+      bool ok = true;
+      uint64_t offset = 0;
+      std::vector<uint8_t> chunk;
+      while (!file_stop.load() && !stop_flag_.load()) {
+        if (!sender.read_chunk(chunk, &error)) {
+          ok = false;
+          break;
+        }
+        if (chunk.empty()) break;
+        if (file_abort_id.load() == transfer_id) {
+          error = "aborted by host";
+          ok = false;
+          break;
+        }
+        std::vector<uint8_t> payload(kFileChunkHeaderBytes + chunk.size());
+        write_u32_le(payload.data(), transfer_id);
+        write_u64_le(payload.data() + 4, offset);
+        std::memcpy(payload.data() + kFileChunkHeaderBytes, chunk.data(), chunk.size());
+        if (!conn.send(MsgType::FileChunk, sid, payload.data(), payload.size())) {
+          error = "send failed";
+          ok = false;
+          break;
+        }
+        offset += chunk.size();
+      }
+      if (ok) {
+        json::Value end = make_object();
+        end.set("transfer_id", static_cast<int64_t>(transfer_id));
+        if (!conn.send_json(MsgType::FileEnd, sid, end)) {
+          error = "send end failed";
+          ok = false;
+        }
+      }
+      if (ok) {
+        log_("INFO", "file", "file sent: " + sender.name() + " (" +
+                                  std::to_string(offset) + " bytes)");
+      } else if (!file_stop.load() && !stop_flag_.load()) {
+        json::Value abort_msg = make_object();
+        abort_msg.set("transfer_id", static_cast<int64_t>(transfer_id));
+        abort_msg.set("reason", error);
+        conn.send_json(MsgType::FileAbort, sid, abort_msg);
+        log_("WARN", "file", "transfer failed: " + error);
+      }
+    }
+  });
+  struct FileJoiner {
+    std::atomic<bool>* stop;
+    std::condition_variable* cv;
+    std::thread* thread;
+    ~FileJoiner() {
+      stop->store(true);
+      cv->notify_all();
+      if (thread->joinable()) thread->join();
+    }
+  } file_joiner{&file_stop, &file_cv_, &file_thread};
+
+  // 剪贴板同步：与会话同生命周期，析构时自动停止 watcher。
+  std::unique_ptr<ClipboardBridge> clipboard;
+  if (cfg_.clipboard) {
+    clipboard = std::make_unique<ClipboardBridge>(
+        [&](const std::string& text) {
+          const uint64_t sid = clipboard_session.load();
+          if (sid == 0) return true;  // 会话尚未建立，等下一次轮询
+          json::Value announce = make_object();
+          announce.set("format", "text");
+          announce.set("size", static_cast<int64_t>(text.size()));
+          if (!conn.send_json(MsgType::ClipboardSet, sid, announce)) return false;
+          return conn.send(MsgType::ClipboardData, sid,
+                           reinterpret_cast<const uint8_t*>(text.data()), text.size());
+        },
+        [&](const std::string& level, const std::string& msg) { log_(level, "clipboard", msg); });
+    clipboard->start();
+  }
+
   while (!stop_flag_.load()) {
     if (renderer) {
       renderer->pump();
@@ -1137,7 +1727,23 @@ int ClientRunner::run() {
         session_id = frame.session_id;
         hb_session.store(session_id);
         input_session_.store(session_id);
+        clipboard_session.store(session_id);
         guard.move_to(SessionState::Ready);
+
+        // 鉴权前先声明本端解码能力，让被控端在开编码器前收敛参数。
+        json::Value caps = make_object();
+        json::Value codecs = json::Value::make_array();
+        codecs.push("h264");  // 当前主控端只实现 H.264 解码
+        caps.set("codec", codecs);
+        caps.set("max_fps", cfg_.fps);
+        caps.set("quality", cfg_.quality);
+        json::Value features = json::Value::make_array();
+        features.push("keyframe-request");
+        features.push("video-stats");
+        caps.set("features", features);
+        if (!conn.send_json(MsgType::CapsNegotiate, session_id, caps)) {
+          log_("WARN", "ctrl", "send caps negotiate failed");
+        }
         log_("INFO", "ctrl", "session " + std::to_string(session_id) + " accepted by host");
         break;
       }
@@ -1229,6 +1835,9 @@ int ClientRunner::run() {
         guard.move_to(SessionState::Ready);
         guard.move_to(SessionState::Streaming);
         log_("INFO", "ctrl", "authenticated");
+        keyframe_session.store(session_id);
+        file_session.store(session_id);
+        request_keyframe("start");
         if (status_cb_) status_cb_("streaming");
         break;
       }
@@ -1259,6 +1868,124 @@ int ClientRunner::run() {
           }
         }
 #endif
+        break;
+      }
+      case MsgType::ClipboardSet: {
+        json::Value payload = parse_payload_cfg(frame);
+        pending_clipboard_size =
+            payload.get("size") ? static_cast<int>(payload.get("size")->as_int(-1)) : -1;
+        break;
+      }
+      case MsgType::ClipboardData: {
+        if (clipboard && pending_clipboard_size >= 0 &&
+            static_cast<int>(frame.payload.size()) == pending_clipboard_size) {
+          clipboard->apply_remote(std::string(frame.payload.begin(), frame.payload.end()));
+        }
+        pending_clipboard_size = -1;
+        break;
+      }
+      case MsgType::FileAccept: {
+        json::Value payload = parse_payload_cfg(frame);
+        const uint32_t tid =
+            payload.get("transfer_id")
+                ? static_cast<uint32_t>(payload.get("transfer_id")->as_int(0))
+                : 0;
+        const bool accept = payload.get("accept") && payload.get("accept")->as_bool();
+        const std::string reason =
+            payload.get("reason") ? payload.get("reason")->as_string("") : "";
+        {
+          std::lock_guard<std::mutex> lock(file_accept_mutex);
+          if (tid == pending_file_id) {
+            file_accept_ready = true;
+            file_accepted = accept;
+            file_accept_reason = reason;
+          }
+        }
+        file_accept_cv.notify_all();
+        break;
+      }
+      case MsgType::FileAbort: {
+        json::Value payload = parse_payload_cfg(frame);
+        const uint32_t tid =
+            payload.get("transfer_id")
+                ? static_cast<uint32_t>(payload.get("transfer_id")->as_int(0))
+                : 0;
+        const std::string reason =
+            payload.get("reason") ? payload.get("reason")->as_string("") : "";
+        file_abort_id.store(tid);
+        log_("WARN", "file",
+             "transfer aborted by host" + (reason.empty() ? "" : ": " + reason));
+        break;
+      }
+      case MsgType::CapsNegotiate: {
+        // 被控端回执：实际采用的编码/分辨率/帧率/画质，以及双方都支持的特性。
+        json::Value payload = parse_payload_cfg(frame);
+        const std::string codec =
+            payload.get("codec") ? payload.get("codec")->as_string(cfg_.codec) : cfg_.codec;
+        const int caps_width =
+            payload.get("width") ? static_cast<int>(payload.get("width")->as_int(0)) : 0;
+        const int caps_height =
+            payload.get("height") ? static_cast<int>(payload.get("height")->as_int(0)) : 0;
+        const int caps_fps =
+            payload.get("fps") ? static_cast<int>(payload.get("fps")->as_int(0)) : 0;
+        const int caps_quality =
+            payload.get("quality") ? static_cast<int>(payload.get("quality")->as_int(0)) : 0;
+        std::string features;
+        const json::Value* list = payload.get("features");
+        if (list && list->is_array()) {
+          for (std::size_t i = 0; i < list->size(); ++i) {
+            if (!features.empty()) features += ",";
+            features += list->at(i).as_string();
+          }
+        }
+        log_("INFO", "ctrl",
+             "caps negotiated: codec=" + codec + " " + std::to_string(caps_width) + "x" +
+                 std::to_string(caps_height) + " fps=" + std::to_string(caps_fps) +
+                 " quality=" + std::to_string(caps_quality) +
+                 (features.empty() ? "" : " features=" + features));
+        break;
+      }
+      case MsgType::VideoStats: {
+        const auto now_tp = std::chrono::steady_clock::now();
+        if (last_stats_log.time_since_epoch().count() == 0 ||
+            now_tp - last_stats_log >= std::chrono::seconds(5)) {
+          last_stats_log = now_tp;
+          json::Value payload = parse_payload_cfg(frame);
+          auto stat_int = [&payload](const char* key) -> int64_t {
+            const json::Value* field = payload.get(key);
+            return field ? field->as_int(0) : 0;
+          };
+          log_("INFO", "ctrl",
+               "stats: sent=" + std::to_string(stat_int("frames_sent")) + " bytes=" +
+                   std::to_string(stat_int("bytes_sent")) + " fps=" +
+                   std::to_string(stat_int("fps")) + " bitrate=" +
+                   std::to_string(stat_int("bitrate_kbps")) + "kbps encode=" +
+                   std::to_string(stat_int("encode_ms")) + "ms captured=" +
+                   std::to_string(stat_int("captured")) + " dropped=" +
+                   std::to_string(stat_int("dropped")));
+        }
+        break;
+      }
+      case MsgType::VideoConfig: {
+        json::Value payload = parse_payload_cfg(frame);
+        const std::string codec =
+            payload.get("codec") ? payload.get("codec")->as_string(cfg_.codec) : cfg_.codec;
+        const int cfg_width =
+            payload.get("width") ? static_cast<int>(payload.get("width")->as_int(0)) : 0;
+        const int cfg_height =
+            payload.get("height") ? static_cast<int>(payload.get("height")->as_int(0)) : 0;
+        const int cfg_fps =
+            payload.get("fps") ? static_cast<int>(payload.get("fps")->as_int(0)) : 0;
+        const int cfg_quality =
+            payload.get("quality") ? static_cast<int>(payload.get("quality")->as_int(0)) : 0;
+        const int cfg_kbps = payload.get("bitrate_kbps")
+                                 ? static_cast<int>(payload.get("bitrate_kbps")->as_int(0))
+                                 : 0;
+        log_("INFO", "ctrl",
+             "video config: codec=" + codec + " " + std::to_string(cfg_width) + "x" +
+                 std::to_string(cfg_height) + " fps=" + std::to_string(cfg_fps) +
+                 " quality=" + std::to_string(cfg_quality) +
+                 (cfg_kbps > 0 ? " bitrate=" + std::to_string(cfg_kbps) + "kbps" : ""));
         break;
       }
       case MsgType::VideoFrame: {
@@ -1292,6 +2019,8 @@ int ClientRunner::run() {
         conn.send_json(MsgType::SessionClose, session_id, ack);
         guard.move_to(SessionState::Closed);
         input_session_.store(0);
+        clipboard_session.store(0);
+        file_session.store(0);
         log_("INFO", "ctrl", "session closed by host");
         if (status_cb_) status_cb_("closed");
         return 0;

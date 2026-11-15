@@ -12,6 +12,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,6 +48,10 @@ uint64_t steady_ms() {
 
 struct Options {
   uint16_t http_port = 8080;
+  // 默认只监听回环地址；需要局域网访问时显式 --listen 0.0.0.0。
+  std::string listen_address = "127.0.0.1";
+  // 网页控制台访问令牌；留空时启动随机生成并打印。
+  std::string token;
   std::string relay_host = "127.0.0.1";
   uint16_t relay_port = kDefaultControlPort;
   std::string target_id;
@@ -61,15 +66,17 @@ struct Options {
 void print_usage() {
   std::printf(
       "用法: rc-web [--target <被控端设备号>] [--password <密码>]\n"
-      "              [--http-port 8080] [--relay 127.0.0.1:21116]\n"
+      "              [--http-port 8080] [--listen 127.0.0.1] [--token <访问令牌>]\n"
+      "              [--relay 127.0.0.1:21116]\n"
       "              [--device-id web-client] [--fps 15] [--quality 70]\n"
       "              [--codec h264]\n"
       "\n"
       "--target/--password 可省略：省略时启动后仅提供网页，由浏览器填写\n"
       "被控端设备 ID 与密码后再建立会话。\n"
+      "--token 省略时自动生成，启动日志会打印带令牌的访问地址。\n"
       "\n"
       "示例: rc-web --http-port 8080\n"
-      "      浏览器打开 http://<本机IP>:8080/ 并填入被控端信息\n");
+      "      浏览器打开 http://127.0.0.1:8080/?token=<访问令牌>\n");
 }
 
 bool split_host_port(const std::string& text, std::string& host, uint16_t& port) {
@@ -99,6 +106,10 @@ bool parse_options(int argc, char** argv, Options& opts) {
     } else if (arg == "--http-port") {
       if (!take_value(value)) return false;
       opts.http_port = static_cast<uint16_t>(std::atoi(value.c_str()));
+    } else if (arg == "--listen") {
+      if (!take_value(opts.listen_address)) return false;
+    } else if (arg == "--token") {
+      if (!take_value(opts.token)) return false;
     } else if (arg == "--relay") {
       if (!take_value(value)) return false;
       split_host_port(value, opts.relay_host, opts.relay_port);
@@ -803,6 +814,72 @@ void bind_routes(HttpServer& server, Gateway& gateway) {
 
 }  // namespace
 
+namespace {
+
+std::string trim_text(const std::string& text) {
+  const std::size_t begin = text.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) return {};
+  const std::size_t end = text.find_last_not_of(" \t\r\n");
+  return text.substr(begin, end - begin + 1);
+}
+
+std::string random_token() {
+  std::random_device rd;
+  std::mt19937_64 rng((static_cast<uint64_t>(rd()) << 32) ^ rd());
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(32);
+  for (int i = 0; i < 32; ++i) out.push_back(kHex[rng() & 0x0F]);
+  return out;
+}
+
+bool token_equal(const std::string& a, const std::string& b) {
+  if (a.empty() || a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  }
+  return diff == 0;
+}
+
+std::string cookie_value(const HttpRequest& request, const std::string& name) {
+  const auto it = request.headers.find("cookie");
+  if (it == request.headers.end()) return {};
+  std::size_t pos = 0;
+  while (pos < it->second.size()) {
+    const std::size_t end = it->second.find(';', pos);
+    const std::string part = trim_text(it->second.substr(
+        pos, end == std::string::npos ? std::string::npos : end - pos));
+    const std::size_t eq = part.find('=');
+    if (eq != std::string::npos && trim_text(part.substr(0, eq)) == name) {
+      return trim_text(part.substr(eq + 1));
+    }
+    if (end == std::string::npos) break;
+    pos = end + 1;
+  }
+  return {};
+}
+
+bool request_authorized(const HttpRequest& request, const std::string& token) {
+  if (token_equal(cookie_value(request, "rc_token"), token)) return true;
+  const auto header = request.headers.find("x-auth-token");
+  if (header != request.headers.end() &&
+      token_equal(trim_text(header->second), token)) {
+    return true;
+  }
+  const auto auth = request.headers.find("authorization");
+  if (auth != request.headers.end()) {
+    const std::string prefix = "Bearer ";
+    if (auth->second.rfind(prefix, 0) == 0 &&
+        token_equal(trim_text(auth->second.substr(prefix.size())), token)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   Options options;
   if (!parse_options(argc, argv, options)) {
@@ -812,12 +889,32 @@ int main(int argc, char** argv) {
 
   net_init();
 
+  if (options.token.empty()) {
+    options.token = random_token();
+    RC_LOGI("web", "未指定 --token，已生成随机访问令牌");
+  }
+
   Gateway gateway(options);
   HttpServer server;
+  const std::string token = options.token;
+  // 除首次带 ?token= 换 cookie 外，所有请求都必须携带有效令牌。
+  server.set_filter([token](const HttpRequest& request, TcpSocket& socket) {
+    if (request_authorized(request, token)) return true;
+    if ((request.path == "/" || request.path == "/index.html") &&
+        token_equal(request.query_param("token"), token)) {
+      http_write_response(socket, 302, "text/plain; charset=utf-8", "",
+                          "Location: /\r\nSet-Cookie: rc_token=" + token +
+                              "; Path=/; HttpOnly; SameSite=Strict\r\n");
+      return false;
+    }
+    http_write_response(socket, 401, "application/json; charset=utf-8",
+                        "{\"error\":\"unauthorized\",\"hint\":\"open /?token=<token>\"}");
+    return false;
+  });
   bind_routes(server, gateway);
 
   std::string error;
-  if (!server.listen(options.http_port, &error)) {
+  if (!server.listen(options.listen_address, options.http_port, &error)) {
     RC_LOGE("web", error);
     return 1;
   }
@@ -833,14 +930,14 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (options.target_id.empty()) {
-    RC_LOGI("web", "网页控制台 http://127.0.0.1:" << options.http_port
-                                << "  等待浏览器填写被控端信息");
-  } else {
-    RC_LOGI("web", "网页控制台 http://127.0.0.1:" << options.http_port
-                                << "  目标=" << options.target_id << "  中继="
-                                << options.relay_host << ":" << options.relay_port);
-  }
+  const std::string display_host =
+      (options.listen_address.empty() || options.listen_address == "0.0.0.0")
+          ? "127.0.0.1"
+          : options.listen_address;
+  RC_LOGI("web", "网页控制台 http://" << display_host << ":" << options.http_port
+                              << "/?token=" << options.token
+                              << (options.target_id.empty() ? "  等待浏览器填写被控端信息"
+                                                            : "  目标=" + options.target_id));
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);

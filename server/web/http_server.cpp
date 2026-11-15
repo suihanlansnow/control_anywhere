@@ -18,7 +18,9 @@ const char* status_text(int status) {
   switch (status) {
     case 200: return "OK";
     case 204: return "No Content";
+    case 302: return "Found";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     default: return "OK";
@@ -56,12 +58,17 @@ std::string HttpRequest::query_param(const std::string& name) const {
 }
 
 bool http_write_response(TcpSocket& socket, int status, const char* content_type,
-                         const std::string& body) {
+                         const std::string& body, const std::string& extra_headers) {
   std::string head = "HTTP/1.1 " + std::to_string(status) + " " + status_text(status) + "\r\n";
   head += "Content-Type: ";
   head += content_type;
   head += "\r\nContent-Length: " + std::to_string(body.size());
-  head += "\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
+  head += "\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n";
+  if (!extra_headers.empty()) {
+    head += extra_headers;
+    if (head.size() < 2 || head.compare(head.size() - 2, 2, "\r\n") != 0) head += "\r\n";
+  }
+  head += "\r\n";
   if (!socket.send_all(head.data(), head.size())) return false;
   return body.empty() || socket.send_all(body.data(), body.size());
 }
@@ -75,6 +82,12 @@ void HttpServer::route(std::string path, HttpHandler handler) {
 
 bool HttpServer::listen(uint16_t port, std::string* error) {
   listener_ = TcpListener::listen(port, error);
+  return listener_.valid();
+}
+
+bool HttpServer::listen(const std::string& bind_address, uint16_t port,
+                        std::string* error) {
+  listener_ = TcpListener::listen(bind_address, port, error);
   return listener_.valid();
 }
 
@@ -107,6 +120,9 @@ void HttpServer::handle_connection(TcpSocket socket) {
   while (!stop_.load()) {
     HttpRequest request;
     if (!read_request(socket, buffer, request)) break;
+
+    // 鉴权过滤器：不合法的请求由过滤器自行写 401/302，不进入路由。
+    if (filter_ && !filter_(request, socket)) continue;
 
     HttpHandler handler;
     {
@@ -161,9 +177,11 @@ bool HttpServer::read_request(TcpSocket& socket, std::string& buffer,
     if (!header.empty() && header.back() == '\r') header.pop_back();
     const std::size_t colon = header.find(':');
     if (colon == std::string::npos) continue;
-    if (lower(trim(header.substr(0, colon))) == "content-length") {
-      content_length = static_cast<std::size_t>(
-          std::strtoul(trim(header.substr(colon + 1)).c_str(), nullptr, 10));
+    const std::string name = lower(trim(header.substr(0, colon)));
+    const std::string value = trim(header.substr(colon + 1));
+    request.headers[name] = value;
+    if (name == "content-length") {
+      content_length = static_cast<std::size_t>(std::strtoul(value.c_str(), nullptr, 10));
     }
   }
 

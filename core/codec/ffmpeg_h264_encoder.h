@@ -8,6 +8,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -26,6 +27,7 @@ class FFmpegH264Encoder : public IVideoEncoder {
   bool open(int width, int height, int fps, int quality, std::string* error) override;
   void close() override;
   bool encode(const CapturedFrame& source, EncodedFrame& out, std::string* error) override;
+  bool request_keyframe() override;
   const char* name() const override {
     return is_hw_ ? "h264-ffmpeg-hw" : "h264-ffmpeg";
   }
@@ -45,6 +47,7 @@ class FFmpegH264Encoder : public IVideoEncoder {
   int quality_ = 75;
   int crf_ = 23;
   int64_t pts_ = 0;
+  std::atomic<bool> keyframe_requested_{false};
   bool is_hw_ = false;
   bool opened_ = false;
   std::deque<uint64_t> pending_capture_ts_;

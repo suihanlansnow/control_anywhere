@@ -24,6 +24,8 @@ class FFmpegJpegEncoder : public IVideoEncoder {
   bool open(int width, int height, int fps, int quality, std::string* error) override;
   void close() override;
   bool encode(const CapturedFrame& source, EncodedFrame& out, std::string* error) override;
+  // JPEG 每帧都是独立帧，任何一帧都能直接解码，无需额外生成关键帧。
+  bool request_keyframe() override { return true; }
   const char* name() const override { return "jpeg-ffmpeg"; }
 
  private:

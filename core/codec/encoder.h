@@ -30,6 +30,10 @@ class IVideoEncoder {
   virtual void close() = 0;
   virtual bool encode(const CapturedFrame& source, EncodedFrame& out,
                       std::string* error) = 0;
+  // 请求下一帧编码为关键帧（IDR）。编码器不支持时返回 false。
+  virtual bool request_keyframe() { return false; }
+  // 目标码率（kbps），0 表示编码器未使用固定码率；用于 VIDEO_CONFIG 下发。
+  virtual int target_bitrate_kbps() const { return 0; }
   // 可选：共享采集侧 D3D11 设备（不透明指针），硬件 MFT 用它做 GPU 纹理零拷贝。
   // 必须在 open() 之前调用。
   virtual bool set_d3d_device(void* device) { return false; }

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace rc {
@@ -11,26 +12,31 @@ void net_init();
 
 class TcpSocket {
  public:
-  TcpSocket() = default;
-  explicit TcpSocket(intptr_t native_fd) : fd_(native_fd) {}
+  TcpSocket();
+  explicit TcpSocket(intptr_t native_fd);
 
-  TcpSocket(TcpSocket&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
-  TcpSocket& operator=(TcpSocket&& other) noexcept {
-    if (this != &other) {
-      close();
-      fd_ = other.fd_;
-      other.fd_ = -1;
-    }
-    return *this;
-  }
+  TcpSocket(TcpSocket&& other) noexcept;
+  TcpSocket& operator=(TcpSocket&& other) noexcept;
 
   TcpSocket(const TcpSocket&) = delete;
   TcpSocket& operator=(const TcpSocket&) = delete;
 
-  ~TcpSocket() { close(); }
+  ~TcpSocket();
 
   bool valid() const { return fd_ != -1; }
   void close();
+
+  // 在已连通的 TCP 上完成 TLS 握手，之后所有读写自动走加密通道。
+  // cert/key 为 PEM 文件；server_name 用于证书主机名校验。
+  // 客户端校验方式：ca_path 非空则按 CA 校验；否则若给 fingerprint_sha256
+  // 则固定证书指纹；insecure=true 表示不校验（仅限本机/测试）。
+  bool start_tls_server(const std::string& cert_path, const std::string& key_path,
+                        std::string* error);
+  bool start_tls_client(const std::string& server_name, const std::string& ca_path,
+                        const std::string& fingerprint_sha256, bool insecure,
+                        std::string* error);
+  bool tls_active() const { return tls_ != nullptr; }
+  std::string tls_peer_fingerprint() const;
 
   bool send_all(const void* data, std::size_t length);
   // 分散写：一次系统调用按序发出多段缓冲（最多 3 段），避免把帧头和载荷
@@ -50,7 +56,10 @@ class TcpSocket {
                            int timeout_ms = 5000, bool no_delay = true);
 
  private:
+  struct TlsImpl;
+
   intptr_t fd_ = -1;
+  std::unique_ptr<TlsImpl> tls_;
 };
 
 class TcpListener {
@@ -76,6 +85,9 @@ class TcpListener {
   void close();
 
   static TcpListener listen(uint16_t port, std::string* error);
+  // 绑定到指定地址；空串或 "*" 表示所有网卡，默认仍监听 0.0.0.0。
+  static TcpListener listen(const std::string& bind_address, uint16_t port,
+                            std::string* error);
   TcpSocket accept();
 
  private:

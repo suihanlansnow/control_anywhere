@@ -70,6 +70,17 @@ struct Options {
   int fps = 60;
   int monitor = 0;
   int quality = 75;
+  // 双向同步纯文本剪贴板；默认关闭，避免无意中泄露本机剪贴板。
+  bool clipboard = false;
+  // 被控端是否接收文件；主控端发送的文件列表。
+  bool file_transfer = false;
+  std::vector<std::string> send_files;
+  // 与中继之间启用 TLS；证书校验方式见 tls_ca / tls_fingerprint / tls_insecure。
+  bool tls = false;
+  std::string tls_ca;
+  std::string tls_fingerprint;
+  std::string tls_server_name;
+  bool tls_insecure = false;
   bool render = true;
   std::string dump_frame;
 };
@@ -79,16 +90,19 @@ void print_usage() {
       "用法:\n"
       "  rc-relay [--port 21116] [--stun host:port] "
       "[--turn [user:pass@]host:port]\n"
+      "           [--tls-cert relay.pem --tls-key relay-key.pem]\n"
       "  rc-cli host    --id <设备号> [--alias 名称] --password <密码> "
       "[--relay 127.0.0.1:21116]\n"
       "                 [--capture dxgi|synthetic] [--codec h264|jpeg] [--fps 60] "
-      "[--quality 75] [--monitor 0] [--frames 60]\n"
+      "[--quality 75] [--monitor 0] [--frames 60] [--clipboard] [--file-transfer]\n"
+      "                 [--tls [--tls-ca CA.pem | --tls-fingerprint SHA256 | --tls-insecure]]\n"
       "                 [--stun host:port] [--turn [user:pass@]host:port] "
       "[--ice-relay] [--ice-tcp]\n"
       "  rc-cli connect <目标设备号> --password <密码> "
       "[--relay 127.0.0.1:21116] [--frames 30]\n"
-      "                 [--transport tcp|webrtc] [--render|--no-render] "
-      "[--dump-frame 首帧.jpg]\n"
+      "                 [--transport tcp|webrtc] [--render|--no-render] [--clipboard] "
+      "[--send-file 文件]...\n"
+      "                 [--tls [--tls-ca CA.pem | --tls-fingerprint SHA256 | --tls-insecure]]\n"
       "                 [--stun host:port] [--turn [user:pass@]host:port] "
       "[--ice-relay] [--ice-tcp]\n"
       "  rc-cli selftest\n");
@@ -154,6 +168,27 @@ bool parse_options(int argc, char** argv, Options& opts) {
       opts.ice_force_relay = true;
     } else if (arg == "--ice-tcp") {
       opts.ice_tcp = true;
+    } else if (arg == "--clipboard") {
+      opts.clipboard = true;
+    } else if (arg == "--file-transfer") {
+      opts.file_transfer = true;
+    } else if (arg == "--send-file") {
+      std::string value;
+      if (!take_value(value)) return false;
+      opts.send_files.push_back(value);
+    } else if (arg == "--tls") {
+      opts.tls = true;
+    } else if (arg == "--tls-ca") {
+      if (!take_value(opts.tls_ca)) return false;
+      opts.tls = true;
+    } else if (arg == "--tls-fingerprint") {
+      if (!take_value(opts.tls_fingerprint)) return false;
+      opts.tls = true;
+    } else if (arg == "--tls-server-name") {
+      if (!take_value(opts.tls_server_name)) return false;
+    } else if (arg == "--tls-insecure") {
+      opts.tls = true;
+      opts.tls_insecure = true;
     } else if (arg == "--monitor") {
       std::string value;
       if (!take_value(value)) return false;
@@ -626,10 +661,17 @@ rc::SessionConfig to_session_config(const Options& opts) {
   cfg.transport = opts.transport;
   cfg.ice_servers = opts.ice_servers;
   cfg.ice_force_relay = opts.ice_force_relay;
+  cfg.tls = opts.tls;
+  cfg.tls_ca = opts.tls_ca;
+  cfg.tls_fingerprint = opts.tls_fingerprint;
+  cfg.tls_server_name = opts.tls_server_name;
+  cfg.tls_insecure = opts.tls_insecure;
   cfg.ice_tcp = opts.ice_tcp;
   cfg.capture = opts.capture;
   cfg.fps = opts.fps;
   cfg.quality = opts.quality;
+  cfg.clipboard = opts.clipboard;
+  cfg.file_transfer = opts.file_transfer;
   cfg.monitor = opts.monitor;
   cfg.max_frames = opts.frames;
   // 之前漏了映射，--no-render 被静默忽略，连接时总会开一个渲染窗口。
@@ -655,15 +697,19 @@ void install_callbacks(rc::HostRunner& runner) {
   });
 }
 
-void install_callbacks(rc::ClientRunner& runner) {
+void install_callbacks(rc::ClientRunner& runner, const std::vector<std::string>& send_files) {
   runner.set_log_callback([](const std::string& tag, const std::string& level,
                               const std::string& msg) {
     std::printf("[%s] %s %s\n", level.c_str(), tag.c_str(), msg.c_str());
     // 重定向到文件时 stdout 是块缓冲，不刷新就看不到运行中的日志。
     std::fflush(stdout);
   });
-  runner.set_status_callback([](const std::string& state) {
+  runner.set_status_callback([&runner, send_files](const std::string& state) {
     std::printf("status: %s\n", state.c_str());
+    // 鉴权通过后才会有会话 ID，此时把命令行带入的文件加入发送队列。
+    if (state == "streaming") {
+      for (const std::string& path : send_files) runner.queue_file(path);
+    }
   });
   runner.set_progress_callback([](int64_t sent, int64_t bytes_total) {
     if (sent > 0 && sent % 30 == 0) {
@@ -684,7 +730,7 @@ int run_host(const Options& opts) {
 int run_connect(const Options& opts) {
   auto cfg = to_session_config(opts);
   rc::ClientRunner runner(cfg);
-  install_callbacks(runner);
+  install_callbacks(runner, opts.send_files);
   return runner.run();
 }
 

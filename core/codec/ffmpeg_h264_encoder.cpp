@@ -203,6 +203,12 @@ void FFmpegH264Encoder::close() {
   rc_pix_fmt_ = AV_PIX_FMT_NONE;
 }
 
+bool FFmpegH264Encoder::request_keyframe() {
+  if (!opened_) return false;
+  keyframe_requested_.store(true);
+  return true;
+}
+
 bool FFmpegH264Encoder::encode(const CapturedFrame& source, EncodedFrame& out,
                                std::string* error) {
   if (!opened_) {
@@ -221,6 +227,9 @@ bool FFmpegH264Encoder::encode(const CapturedFrame& source, EncodedFrame& out,
   sws_scale(sws_, src_data, src_linesize, 0, source.height,
             frame_->data, frame_->linesize);
 
+  // 强制关键帧：libx264/nvenc/qsv 都会把 pict_type=I 的帧编成 IDR。
+  frame_->pict_type = keyframe_requested_.exchange(false) ? AV_PICTURE_TYPE_I
+                                                          : AV_PICTURE_TYPE_NONE;
   frame_->pts = pts_++;
   // 时间戳队列只为把输出的包映射回采集时刻；编码器长时间不出包时不能无限增长，
   // 只保留最近若干帧即可（更老的映射已无意义）。

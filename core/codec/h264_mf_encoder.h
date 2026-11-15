@@ -3,6 +3,8 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <codecapi.h>
+#include <icodecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -10,6 +12,7 @@
 #include <mftransform.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -32,6 +35,8 @@ class H264MfEncoder final : public IVideoEncoder {
               std::string* error) override;
   bool set_d3d_device(void* device) override;
   bool accepts_texture_input() const override { return texture_input_; }
+  bool request_keyframe() override;
+  int target_bitrate_kbps() const override { return static_cast<int>(bitrate_ / 1000); }
   void* native_device_manager() override { return device_manager_.Get(); }
   const char* name() const override { return hardware_ ? "h264-mf-hw" : "h264-mf-sw"; }
 
@@ -47,6 +52,8 @@ class H264MfEncoder final : public IVideoEncoder {
   bool copy_to_sample(const std::shared_ptr<void>& texture, IMFSample* sample,
                       std::string* error);
   bool accept_input(IMFSample* prepared, std::string* error);
+  // 把 request_keyframe() 置位的请求在送下一帧输入前交给 MFT。
+  void apply_pending_keyframe();
   bool produce_output(EncodedFrame& out, int timeout_ms, std::string* error);
   // 等待指定事件；期间出现的 NeedInput / HaveOutput 记为令牌，避免事件被吞掉后死锁。
   bool wait_event(uint32_t want, int timeout_ms);
@@ -54,6 +61,8 @@ class H264MfEncoder final : public IVideoEncoder {
 
   Microsoft::WRL::ComPtr<IMFTransform> transform_;
   Microsoft::WRL::ComPtr<IMFMediaEventGenerator> events_;
+  // 部分硬编通过 ICodecAPI 支持强制关键帧；不支持时为空。
+  Microsoft::WRL::ComPtr<ICodecAPI> codec_api_;
   Microsoft::WRL::ComPtr<IUnknown> shared_device_;
   Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> device_manager_;
   // 输入纹理必须来自样本分配器；NVENC 不暴露自己的实现，用通用分配器兜底。
@@ -75,6 +84,8 @@ class H264MfEncoder final : public IVideoEncoder {
   // 输入帧与输出帧错开一帧（NVENC 有约 1 帧流水延迟），按序回填采集时间戳。
   std::deque<uint64_t> pending_capture_ts_;
 
+  std::atomic<bool> keyframe_requested_{false};
+  bool keyframe_unsupported_ = false;
   bool async_ = false;
   bool hardware_ = false;
   bool texture_input_ = false;

@@ -36,6 +36,9 @@ std::map<uint64_t, std::shared_ptr<Peer>> g_pending;  // session_id -> controlle
 std::atomic<uint64_t> g_next_session{1000};
 // 启动参数指定，之后只读；随 RegisterAck 下发给被控端和主控端。
 std::vector<std::string> g_ice_servers;
+// 非空表示所有入站连接都要求 TLS（PEM 证书与私钥）。
+std::string g_tls_cert;
+std::string g_tls_key;
 
 json::Value object() { return json::Value::make_object(); }
 
@@ -318,13 +321,23 @@ int main(int argc, char** argv) {
       g_ice_servers.push_back(with_scheme(argv[++i], "stun:"));
     } else if (arg == "--turn" && has_next) {
       g_ice_servers.push_back(with_scheme(argv[++i], "turn:"));
+    } else if (arg == "--tls-cert" && has_next) {
+      g_tls_cert = argv[++i];
+    } else if (arg == "--tls-key" && has_next) {
+      g_tls_key = argv[++i];
     } else {
       std::fprintf(stderr,
                    "usage: %s [--port N] [--stun host:port] "
-                   "[--turn [user:pass@]host:port]\n",
+                   "[--turn [user:pass@]host:port]\n"
+                   "       [--tls-cert relay.pem --tls-key relay-key.pem]\n",
                    argv[0]);
       return 2;
     }
+  }
+
+  if (g_tls_cert.empty() != g_tls_key.empty()) {
+    std::fprintf(stderr, "--tls-cert 与 --tls-key 必须同时提供\n");
+    return 2;
   }
 
   std::string error;
@@ -334,11 +347,21 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  RC_LOGI("relay", "listening on tcp/" << port);
+  RC_LOGI("relay", "listening on tcp/" << port
+                                   << (g_tls_cert.empty() ? " (plaintext)" : " (TLS)"));
   while (true) {
     TcpSocket socket = listener.accept();
     if (!socket.valid()) continue;
-    auto conn = std::make_shared<Connection>(std::move(socket));
-    std::thread([conn] { handle_client(conn); }).detach();
+    std::thread([sock = std::move(socket)]() mutable {
+      if (!g_tls_cert.empty()) {
+        std::string error;
+        if (!sock.start_tls_server(g_tls_cert, g_tls_key, &error)) {
+          RC_LOGW("relay", "TLS handshake failed: " << error);
+          return;
+        }
+      }
+      auto conn = std::make_shared<Connection>(std::move(sock));
+      handle_client(conn);
+    }).detach();
   }
 }
