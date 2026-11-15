@@ -18,6 +18,7 @@ set(RC_CORE_SOURCES
   core/base/log.cpp
   core/base/json.cpp
   core/crypto/hash.cpp
+  core/crypto/device_identity.cpp
   core/net/socket.cpp
   core/net/connection.cpp
   core/protocol/protocol.cpp

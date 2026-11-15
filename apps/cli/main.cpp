@@ -52,6 +52,8 @@ struct Options {
   std::string device_id;
   std::string alias;
   std::string password;
+  // 设备身份私钥文件；留空用默认位置（%APPDATA%/XDG 配置目录下的 rc-desktop/identity.pem）。
+  std::string identity_path;
   std::string relay_host = "127.0.0.1";
 #ifdef __linux__
   std::string capture = "x11";
@@ -95,6 +97,7 @@ void print_usage() {
       "[--relay 127.0.0.1:21116]\n"
       "                 [--capture dxgi|synthetic] [--codec h264|jpeg] [--fps 60] "
       "[--quality 75] [--monitor 0] [--frames 60] [--clipboard] [--file-transfer]\n"
+      "                 [--identity identity.pem]\n"
       "                 [--tls [--tls-ca CA.pem | --tls-fingerprint SHA256 | --tls-insecure]]\n"
       "                 [--stun host:port] [--turn [user:pass@]host:port] "
       "[--ice-relay] [--ice-tcp]\n"
@@ -137,6 +140,8 @@ bool parse_options(int argc, char** argv, Options& opts) {
       if (!take_value(opts.alias)) return false;
     } else if (arg == "--password") {
       if (!take_value(opts.password)) return false;
+    } else if (arg == "--identity") {
+      if (!take_value(opts.identity_path)) return false;
     } else if (arg == "--relay") {
       std::string value;
       if (!take_value(value)) return false;
@@ -657,6 +662,7 @@ rc::SessionConfig to_session_config(const Options& opts) {
   cfg.alias = opts.alias;
   cfg.target_id = opts.target_id;
   cfg.password = opts.password;
+  cfg.identity_path = opts.identity_path;
   cfg.codec = opts.codec;
   cfg.transport = opts.transport;
   cfg.ice_servers = opts.ice_servers;

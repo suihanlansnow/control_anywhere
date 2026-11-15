@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "base/clock.h"
+#include "crypto/device_identity.h"
 #include "crypto/hash.h"
 #include "net/connection.h"
 #include "net/socket.h"
@@ -44,10 +45,16 @@ static constexpr const char* kInputBackendName = "SendInput";
 
 static json::Value make_object() { return json::Value::make_object(); }
 
-static bool send_register_cfg(Connection& conn, const SessionConfig& cfg) {
+// role 决定中继是否要求设备身份：只有被控端（可被连接的目标）必须证明归属，
+// 主控端不参与 device_id 抢注，保持轻量注册。
+static bool send_register_cfg(Connection& conn, const SessionConfig& cfg,
+                              const char* role,
+                              const DeviceIdentity* identity) {
   json::Value request = make_object();
   request.set("device_id", cfg.device_id);
   request.set("alias", cfg.alias.empty() ? cfg.device_id : cfg.alias);
+  request.set("role", role);
+  if (identity && identity->valid()) request.set("pub_key", identity->public_key());
 #ifdef __linux__
   request.set("os", "linux");
 #else
@@ -981,6 +988,21 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
 }
 
 int HostRunner::run() {
+  // 设备身份：首次运行自动生成并保存，之后每次注册都用它证明 device_id 归属，
+  // 防止别人用同一个设备号顶号。
+  DeviceIdentity identity;
+  if (DeviceIdentity::available()) {
+    std::string identity_error;
+    if (!identity.load_or_create(cfg_.identity_path, &identity_error)) {
+      log_("ERROR", "host", "device identity unavailable: " + identity_error);
+      return 2;
+    }
+    log_("INFO", "host", "device identity loaded (" + identity.public_key().substr(0, 16) +
+                             "…)");
+  } else {
+    log_("WARN", "host", "built without mbed TLS, registering without device identity");
+  }
+
   std::string error;
   TcpSocket socket = TcpSocket::connect(cfg_.relay_host, cfg_.relay_port, &error,
                                         cfg_.connect_timeout_ms, cfg_.tcp_no_delay);
@@ -1006,7 +1028,7 @@ int HostRunner::run() {
 
   Connection conn(std::move(socket));
   conn.set_recv_timeout_ms(30000);
-  if (!send_register_cfg(conn, cfg_)) {
+  if (!send_register_cfg(conn, cfg_, "host", &identity)) {
     log_("ERROR", "host", "register send failed");
     return 2;
   }
@@ -1025,10 +1047,40 @@ int HostRunner::run() {
     }
 
     switch (frame.type) {
+      case MsgType::RegisterChallenge: {
+        // 中继下发 nonce，用设备私钥签名后回 RegisterProof。
+        json::Value payload = parse_payload_cfg(frame);
+        std::string nonce_b64;
+        if (const json::Value* value = payload.get("nonce")) {
+          nonce_b64 = value->as_string("");
+        }
+        if (nonce_b64.empty()) {
+          log_("ERROR", "host", "register challenge without nonce");
+          return 2;
+        }
+        std::string signature;
+        std::string sign_error;
+        const std::string proof = "rc-register-v1|" + cfg_.device_id + "|" + nonce_b64;
+        if (!identity.sign(proof, signature, &sign_error)) {
+          log_("ERROR", "host", "device identity sign failed: " + sign_error);
+          return 2;
+        }
+        json::Value reply = make_object();
+        reply.set("device_id", cfg_.device_id);
+        reply.set("pub_key", identity.public_key());
+        reply.set("signature", signature);
+        conn.send_json(MsgType::RegisterProof, 0, reply);
+        log_("INFO", "host", "register proof sent");
+        break;
+      }
       case MsgType::RegisterAck: {
         json::Value payload = parse_payload_cfg(frame);
         if (!payload.get("ok") || !payload.get("ok")->as_bool()) {
-          log_("ERROR", "host", "register rejected");
+          std::string reason = "unknown";
+          if (const json::Value* value = payload.get("reason")) {
+            reason = value->as_string("unknown");
+          }
+          log_("ERROR", "host", "register rejected: " + reason);
           return 2;
         }
         relay_ice_servers_ = parse_ice_servers(payload);
@@ -1262,7 +1314,7 @@ int ClientRunner::run() {
 
   Connection conn(std::move(socket));
   conn.set_recv_timeout_ms(15000);
-  if (!send_register_cfg(conn, cfg_)) {
+  if (!send_register_cfg(conn, cfg_, "controller", nullptr)) {
     log_("ERROR", "ctrl", "register send failed");
     return 2;
   }

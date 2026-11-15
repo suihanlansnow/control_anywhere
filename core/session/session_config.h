@@ -14,6 +14,9 @@ struct SessionConfig {
   std::string alias;
   std::string target_id;
   std::string password;
+  // 设备身份私钥文件；留空时用 DeviceIdentity::default_path()。
+  // 仅被控端注册时需要，用于向中继证明 device_id 归属。
+  std::string identity_path;
   std::string codec = "h264";
   std::string capture;
   // 视频传输方式："tcp"（默认，走中继的 24 字节帧）或 "webrtc"（RTP/SCTP，

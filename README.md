@@ -95,6 +95,27 @@ Qt 端在「网络」页勾选「TLS 加密」并填入中继证书指纹即可�
 
 自签证书可用 mbed TLS 自带的 `gen_key` / `cert_write` 生成，或使用任意标准 X.509 工具。
 
+#### 设备身份与防顶号
+
+被控端首次启动会在本机生成 EC P-256 私钥并保存：
+
+- Windows：`%APPDATA%\rc-desktop\identity.pem`
+- Linux：`$XDG_CONFIG_HOME/rc-desktop/identity.pem`（缺省 `~/.config`）
+- CLI 可用 `--identity <文件>` 指定其他位置。
+
+注册时中继下发一次性 nonce，被控端用私钥对 `rc-register-v1|<设备号>|<nonce>` 签名；
+中继校验通过后把公钥**固定**到该设备号，之后只有同一密钥的重连才会被接受，
+其他密钥会收到 `device_id_taken`。同一密钥重连会替换旧连接，用于断线后快速重注册。
+
+固定关系默认写入 `relay-devices.json`（当前工作目录），可用：
+
+```bash
+rc-relay --port 21116 --device-db /var/lib/rc/relay-devices.json   # 自定义位置
+rc-relay --port 21116 --no-device-db                                # 只在内存固定
+```
+
+> 主控端不参与设备号固定，注册更轻量；设备身份只保护可被连接的被控端。
+
 ### 2. Windows / Ubuntu 桌面端
 
 启动 `rc-app` 即可，**被控端会自动开启**，无需点击任何按钮：
@@ -173,6 +194,7 @@ rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
 - **复用单通道**：视频、输入、剪贴板与文件默认走同一 TCP 会话，中继按 `session_id` 转发。
 - **能力协商**：`CapsNegotiate` 收敛编码器、帧率与质量；`VideoConfig` 下发参数；`KeyframeReq` 强制 IDR；`VideoStats` 每秒回传编码统计。
 - **HMAC-SHA256 鉴权**：中继下发挑战，被控端用密码生成 proof，主控端回传验证。
+- **设备身份与防顶号**：被控端用本地 EC P-256 私钥响应中继挑战，中继按设备号固定公钥并持久化，异键注册被拒。
 - **可选 TLS**：中继与两端之间支持 mbed TLS 加密，可用 CA、证书指纹或显式不安全模式校验。
 - **跨平台采集**：Windows DXGI；Linux X11 或 PipeWire（xdg-desktop-portal）。
 - **跨平台注入**：Windows `SendInput`；Linux `/dev/uinput`（支持 Wayland 与 X11）。
@@ -191,6 +213,8 @@ rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
 - JPEG 编码路径缺少桌面端解码器，实际互通只使用 H.264。
 - 文件传输为单向（主控→被控）、自动接受，无断点续传、进度条与取消按钮。
 - Linux 输入注入依赖 `/dev/uinput` 权限，需配置 udev 规则。
+- 设备身份只约束被控端；主控端设备号未绑定公钥，且暂无密钥吊销/轮换流程。
+- 公钥固定采用 TOFU：设备首次注册前（或身份库丢失后）仍存在抢注窗口。
 
 ## 文档
 

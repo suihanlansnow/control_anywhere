@@ -31,14 +31,21 @@ messages:
   - { code: 0x01, name: HELLO_REQ,        dir: client->relay, encoding: json }
   - { code: 0x02, name: HELLO_RSP,        dir: relay->client, encoding: json }
   - { code: 0x03, name: REGISTER,         dir: client->relay, encoding: json,
-      fields: [device_id, alias, os, os_ver, app, pub_key, caps] }
-  - { code: 0x04, name: REGISTER_ACK,     dir: relay->client, encoding: json, fields: [ok, device_id, reason] }
+      fields: [device_id, alias, role, os, os_ver, app, pub_key, caps] }
+  - { code: 0x04, name: REGISTER_ACK,     dir: relay->client, encoding: json,
+      fields: [ok, device_id, reason, verified] }
   - { code: 0x05, name: CONNECT_REQ,      dir: controller->relay, encoding: json,
       fields: [target_id, mode, want] }
   - { code: 0x06, name: CONNECT_RSP,      dir: relay->controller, encoding: json,
       fields: [ok, session_id, relay, expire, reason] }
+  # 被控端注册（role=host）必须先过身份挑战：relay 下发随机 nonce，
+  # 客户端用设备私钥对 "rc-register-v1|<device_id>|<nonce>" 做 ECDSA-SHA256 签名。
+  - { code: 0x07, name: REGISTER_CHALLENGE, dir: relay->client, encoding: json,
+      fields: [device_id, nonce] }
   - { code: 0x08, name: PING,             dir: both, encoding: json }
   - { code: 0x09, name: PONG,             dir: both, encoding: json }
+  - { code: 0x0B, name: REGISTER_PROOF,   dir: client->relay, encoding: json,
+      fields: [device_id, pub_key, signature] }
 
   - { code: 0x10, name: SESSION_INVITE,   dir: relay->host, encoding: json,
       fields: [session_id, from, want] }
@@ -105,6 +112,6 @@ timeouts:
 
 # M0 简化项（M1 必须补齐）
 m0_deviations:
-  - TLS 未接入：控制面当前为明文 TCP，仅限本机联调
-  - 端到端加密未接入：中继可见会话载荷
-  - 鉴权使用 HMAC-SHA256(sha256(password), nonce)，正式版需 PBKDF2 + Ed25519 设备签名
+  - 端到端加密未接入：中继可见会话载荷（TLS 只保护传输段）
+  - 鉴权使用 HMAC-SHA256(sha256(password), nonce)，正式版需 PBKDF2 + 一次性口令
+  - 设备身份为 EC P-256 挑战签名（防顶号），后续计划升级 Ed25519

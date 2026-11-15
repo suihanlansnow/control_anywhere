@@ -20,10 +20,13 @@ enum class MsgType : uint8_t {
   RegisterAck = 0x04,
   ConnectReq = 0x05,
   ConnectRsp = 0x06,
+  // 中继要求设备证明身份：下发随机 nonce，设备用私钥签名后回 RegisterProof。
+  RegisterChallenge = 0x07,
   Ping = 0x08,
   Pong = 0x09,
   // 被控端空闲（画面静止、采集无更新）时的心跳，防止主控端读超时误判断线。
   Heartbeat = 0x0A,
+  RegisterProof = 0x0B,
 
   SessionInvite = 0x10,
   SessionAccept = 0x11,

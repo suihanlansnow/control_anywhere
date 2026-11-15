@@ -83,9 +83,11 @@ const char* msg_type_name(MsgType type) {
     case MsgType::RegisterAck: return "REGISTER_ACK";
     case MsgType::ConnectReq: return "CONNECT_REQ";
     case MsgType::ConnectRsp: return "CONNECT_RSP";
+    case MsgType::RegisterChallenge: return "REGISTER_CHALLENGE";
     case MsgType::Ping: return "PING";
     case MsgType::Pong: return "PONG";
     case MsgType::Heartbeat: return "HEARTBEAT";
+    case MsgType::RegisterProof: return "REGISTER_PROOF";
     case MsgType::SessionInvite: return "SESSION_INVITE";
     case MsgType::SessionAccept: return "SESSION_ACCEPT";
     case MsgType::SessionReject: return "SESSION_REJECT";
