@@ -34,20 +34,27 @@ class MainWindow : public QMainWindow {
  private slots:
   void onNavClicked(int index);
   void onStartHost();
+  void onStopHost();
   void onStartClient();
-  void onStop();
+  void onStopClient();
   void onSaveSettings();
+  void onCopyDeviceId();
+  void onCopyHostPassword();
+  void onToggleHostPassword();
+  void onRegenerateHostPassword();
+  void onHostStatus(const QString& state);
+  void onClientStatus(const QString& state);
   void onLogMsg(const QString& tag, const QString& level, const QString& msg);
-  void onStatusChanged(const QString& state);
   void onProgressUpdated(int frames, qlonglong bytes);
   void onFrameReady(QImage image);
-  void onWorkerFinished(int rc);
+  void onHostFinished(int rc);
+  void onClientFinished(int rc);
   void onTrayActivated(QSystemTrayIcon::ActivationReason reason);
 
  private:
   void buildUI();
   QWidget* buildSidebar();
-  QWidget* buildSecurityPanel();
+  QWidget* buildConnectPanel();
   QWidget* buildDisplayPanel();
   QWidget* buildNetworkPanel();
   QWidget* buildPermissionPanel();
@@ -56,6 +63,9 @@ class MainWindow : public QMainWindow {
   QPushButton* makeNavButton(const QString& text, int iconIndex);
   void saveSettings();
   void loadSettings();
+  void ensureDeviceIdentity();
+  void autoStartHost();
+  void updateStatusLabel();
   void initTrayIcon();
 
   QStackedWidget* panels_ = nullptr;
@@ -64,17 +74,26 @@ class MainWindow : public QMainWindow {
   // 远程画面显示区（解码后的 BGRA 缩放上屏）。
   QWidget* videoView_ = nullptr;
 
-  QLineEdit* editPassword_ = nullptr;
-  QCheckBox* switchForcePwd_ = nullptr;
-  QCheckBox* switchAes_ = nullptr;
-  QCheckBox* switchCertVerify_ = nullptr;
+  // 本机（被控端）身份
+  QLineEdit* editDeviceId_ = nullptr;
+  QLineEdit* editPassword_ = nullptr;      // 本机被控密码
+  QPushButton* btnPasswordToggle_ = nullptr;
+  QLabel* hostStatusLabel_ = nullptr;
+  QPushButton* btnHostStart_ = nullptr;
+  QPushButton* btnHostStop_ = nullptr;
+
+  // 连接远程设备
+  QLineEdit* editRelayHost_ = nullptr;
+  QSpinBox* spinRelayPort_ = nullptr;
+  QLineEdit* editTargetId_ = nullptr;
+  QLineEdit* editConnectPassword_ = nullptr;
+  QLabel* clientStatusLabel_ = nullptr;
+  QPushButton* btnConnect_ = nullptr;
+  QPushButton* btnDisconnect_ = nullptr;
 
   QComboBox* comboCodec_ = nullptr;
   QCheckBox* switchAutoBitrate_ = nullptr;
 
-  QLineEdit* editRelayHost_ = nullptr;
-  QSpinBox* spinRelayPort_ = nullptr;
-  QLineEdit* editDeviceId_ = nullptr;
   QSlider* sliderTimeout_ = nullptr;
   QLabel* labelTimeoutVal_ = nullptr;
   QCheckBox* switchAutoReconnect_ = nullptr;
@@ -92,8 +111,15 @@ class MainWindow : public QMainWindow {
   QLabel* badgeCodec_ = nullptr;
   QLabel* badgeLoss_ = nullptr;
 
-  QThread* workerThread_ = nullptr;
-  BackendWorker* worker_ = nullptr;
+  // 被控端与主控端各占一个线程：HostRunner / ClientRunner 都是阻塞运行，
+  // 共用线程会导致开启被控后无法再连接其他设备。
+  QThread* hostThread_ = nullptr;
+  BackendWorker* hostWorker_ = nullptr;
+  QThread* clientThread_ = nullptr;
+  BackendWorker* clientWorker_ = nullptr;
+
+  QString hostState_;
+  QString clientState_;
 
   QSystemTrayIcon* trayIcon_ = nullptr;
   QMenu* trayMenu_ = nullptr;

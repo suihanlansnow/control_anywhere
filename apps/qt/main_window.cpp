@@ -6,18 +6,23 @@
 
 // 同一套 UI 在两平台复用，仅采集后端与默认设备名按平台切换。
 #if defined(_WIN32)
-static constexpr const char* kPlatformHostId = "win-host";
+static constexpr const char* kPlatformPrefix = "win";
+static constexpr const char* kPlatformFallbackHostId = "win-host";
 static constexpr const char* kPlatformClientId = "win-client";
 static constexpr const char* kPlatformCapture = "dxgi";
 static constexpr const char* kPlatformName = "Windows";
 #else
-static constexpr const char* kPlatformHostId = "linux-host";
+static constexpr const char* kPlatformPrefix = "linux";
+static constexpr const char* kPlatformFallbackHostId = "linux-host";
 static constexpr const char* kPlatformClientId = "linux-client";
 static constexpr const char* kPlatformCapture = "x11";
 static constexpr const char* kPlatformName = "Linux";
 #endif
 
 #include <QAction>
+#include <QApplication>
+#include <QClipboard>
+#include <QCursor>
 #include <QMenu>
 #include <QButtonGroup>
 #include <QCheckBox>
@@ -34,18 +39,54 @@ static constexpr const char* kPlatformName = "Linux";
 #include <QPainter>
 #include <QPixmap>
 #include <QPushButton>
+#include <QRandomGenerator>
 #include <QSet>
 #include <QSettings>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QSysInfo>
 #include <QTextEdit>
+#include <QToolTip>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
 
 namespace {
+
+// 只保留字母数字与短横线，避免设备 ID 里出现空格、点号等在命令行/URL 中需要转义的字符。
+QString sanitizeId(const QString& text) {
+  QString out;
+  for (const QChar ch : text) {
+    if (ch.isLetterOrNumber()) {
+      out.append(ch.toLower());
+    } else if (ch == '-' || ch == '_') {
+      out.append(ch);
+    }
+  }
+  return out.left(24);
+}
+
+// 首次启动时生成平台前缀 + 主机名的唯一设备 ID，避免多台机器默认 ID 撞号。
+QString defaultDeviceId() {
+  QString host = sanitizeId(QSysInfo::machineHostName());
+  if (host.isEmpty()) return QString::fromLatin1(kPlatformFallbackHostId);
+  if (!host.startsWith(QString::fromLatin1(kPlatformPrefix) + "-")) {
+    host.prepend(QString::fromLatin1(kPlatformPrefix) + "-");
+  }
+  return host.left(32);
+}
+
+QString randomPassword() {
+  static const char kChars[] = "abcdefghjkmnpqrstuvwxyz23456789";
+  const int count = static_cast<int>(sizeof(kChars)) - 1;
+  QString out;
+  for (int i = 0; i < 8; ++i) {
+    out.append(QChar(kChars[QRandomGenerator::global()->bounded(count)]));
+  }
+  return out;
+}
 
 class VideoWidget : public QWidget {
  public:
@@ -302,26 +343,38 @@ class VideoWidget : public QWidget {
 }  // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
-  setWindowTitle(tr("远程控制 · 设置"));
+  setWindowTitle(tr("远程控制"));
   setObjectName("MainWindow");
   buildUI();
 
-  workerThread_ = new QThread(this);
-  worker_ = new BackendWorker();
-  worker_->moveToThread(workerThread_);
-  connect(workerThread_, &QThread::finished, worker_, &QObject::deleteLater);
-  connect(this, &MainWindow::destroyed, workerThread_, &QThread::quit);
+  // 被控端与主控端必须各自独占线程：两个 Runner 的 run() 都是阻塞的，
+  // 共用同一个 worker 会出现在"已开启被控"后无法再连接其他设备的问题。
+  hostThread_ = new QThread(this);
+  hostWorker_ = new BackendWorker();
+  hostWorker_->moveToThread(hostThread_);
+  connect(hostThread_, &QThread::finished, hostWorker_, &QObject::deleteLater);
+  connect(hostWorker_, &BackendWorker::logMessage, this, &MainWindow::onLogMsg);
+  connect(hostWorker_, &BackendWorker::statusChanged, this, &MainWindow::onHostStatus);
+  connect(hostWorker_, &BackendWorker::finished, this, &MainWindow::onHostFinished);
+  hostThread_->start();
 
-  connect(worker_, &BackendWorker::logMessage, this, &MainWindow::onLogMsg);
-  connect(worker_, &BackendWorker::statusChanged, this, &MainWindow::onStatusChanged);
-  connect(worker_, &BackendWorker::progressUpdated, this, &MainWindow::onProgressUpdated);
-  connect(worker_, &BackendWorker::frameReady, this, &MainWindow::onFrameReady);
-  connect(worker_, &BackendWorker::finished, this, &MainWindow::onWorkerFinished);
-
-  workerThread_->start();
+  clientThread_ = new QThread(this);
+  clientWorker_ = new BackendWorker();
+  clientWorker_->moveToThread(clientThread_);
+  connect(clientThread_, &QThread::finished, clientWorker_, &QObject::deleteLater);
+  connect(clientWorker_, &BackendWorker::logMessage, this, &MainWindow::onLogMsg);
+  connect(clientWorker_, &BackendWorker::statusChanged, this, &MainWindow::onClientStatus);
+  connect(clientWorker_, &BackendWorker::progressUpdated, this, &MainWindow::onProgressUpdated);
+  connect(clientWorker_, &BackendWorker::frameReady, this, &MainWindow::onFrameReady);
+  connect(clientWorker_, &BackendWorker::finished, this, &MainWindow::onClientFinished);
+  clientThread_->start();
 
   loadSettings();
+  ensureDeviceIdentity();
   initTrayIcon();
+
+  // 程序启动即自动开启被控端，远端只需输入设备 ID 与密码即可接入。
+  autoStartHost();
 }
 
 MainWindow::~MainWindow() {
@@ -331,10 +384,15 @@ MainWindow::~MainWindow() {
     video->releaseAll();
     if (video->isFullScreen()) video->toggleFullscreen();
   }
-  if (workerThread_) {
-    worker_->stop();
-    workerThread_->quit();
-    workerThread_->wait(2000);
+  if (hostThread_) {
+    if (hostWorker_) hostWorker_->stop();
+    hostThread_->quit();
+    hostThread_->wait(2000);
+  }
+  if (clientThread_) {
+    if (clientWorker_) clientWorker_->stop();
+    clientThread_->quit();
+    clientThread_->wait(2000);
   }
 }
 
@@ -367,7 +425,7 @@ void MainWindow::buildUI() {
   root->addWidget(buildSidebar());
 
   panels_ = new QStackedWidget();
-  panels_->addWidget(buildSecurityPanel());
+  panels_->addWidget(buildConnectPanel());
   panels_->addWidget(buildDisplayPanel());
   panels_->addWidget(buildNetworkPanel());
   panels_->addWidget(buildPermissionPanel());
@@ -421,7 +479,7 @@ QWidget* MainWindow::buildSidebar() {
 
   struct NavItem { QString label; int idx; };
   QList<NavItem> items = {
-    {tr("安全"), 0}, {tr("显示"), 1}, {tr("网络"), 2}, {tr("权限"), 3}, {tr("关于"), 4}
+    {tr("连接"), 0}, {tr("显示"), 1}, {tr("网络"), 2}, {tr("权限"), 3}, {tr("关于"), 4}
   };
   QButtonGroup* group = new QButtonGroup(this);
   group->setExclusive(true);
@@ -483,7 +541,7 @@ QFrame* MainWindow::makeCard(const QString& title) {
   return card;
 }
 
-QWidget* MainWindow::buildSecurityPanel() {
+QWidget* MainWindow::buildConnectPanel() {
   auto* panel = new QWidget();
   auto* scroll = new QVBoxLayout(panel);
   scroll->setContentsMargins(32, 24, 32, 24);
@@ -493,86 +551,153 @@ QWidget* MainWindow::buildSecurityPanel() {
   auto* hl = new QVBoxLayout(header);
   hl->setContentsMargins(0, 0, 0, 4);
   hl->setSpacing(4);
-  auto* title = new QLabel(tr("安全"));
+  auto* title = new QLabel(tr("连接"));
   title->setObjectName("PanelTitle");
-  auto* desc = new QLabel(tr("配置连接认证与加密，保护远程会话安全。"));
+  auto* desc = new QLabel(tr("本机启动后已自动开启被控端。远端只要输入下面的设备 ID 与密码即可连接；"
+                             "本机也可以在这里连接其他设备。"));
   desc->setObjectName("PanelDesc");
   desc->setWordWrap(true);
   hl->addWidget(title);
   hl->addWidget(desc);
   scroll->addWidget(header);
 
-  auto* card1 = makeCard(tr("连接认证"));
+  auto* card1 = makeCard(tr("本机（被控端 · 已自动开启）"));
   {
     auto* vbox = static_cast<QVBoxLayout*>(card1->layout());
-    auto* lbl1 = new QLabel(tr("连接密码"));
-    lbl1->setObjectName("FieldLabel");
-    vbox->addWidget(lbl1);
+
+    auto* idRow = new QHBoxLayout();
+    idRow->setSpacing(10);
+    auto* idCol = new QVBoxLayout();
+    auto* lblId = new QLabel(tr("设备 ID（远端填写此项）"));
+    lblId->setObjectName("FieldLabel");
+    editDeviceId_ = new QLineEdit();
+    editDeviceId_->setPlaceholderText(tr("自动生成"));
+    idCol->addWidget(lblId);
+    idCol->addWidget(editDeviceId_);
+    idRow->addLayout(idCol, 1);
+    auto* copyIdBtn = new QPushButton(tr("复制"));
+    copyIdBtn->setObjectName("BtnGhost");
+    idRow->addWidget(copyIdBtn, 0, Qt::AlignBottom);
+    vbox->addLayout(idRow);
+
+    vbox->addSpacing(4);
+    auto* pwdRow = new QHBoxLayout();
+    pwdRow->setSpacing(10);
+    auto* pwdCol = new QVBoxLayout();
+    auto* lblPwd = new QLabel(tr("连接密码"));
+    lblPwd->setObjectName("FieldLabel");
     editPassword_ = new QLineEdit();
     editPassword_->setEchoMode(QLineEdit::Password);
-    editPassword_->setPlaceholderText(tr("输入连接密码"));
-    vbox->addWidget(editPassword_);
-    auto* hint = new QLabel(tr("长度不少于 6 位，建议包含字母与数字组合。"));
+    editPassword_->setPlaceholderText(tr("自动生成"));
+    pwdCol->addWidget(lblPwd);
+    pwdCol->addWidget(editPassword_);
+    pwdRow->addLayout(pwdCol, 1);
+    btnPasswordToggle_ = new QPushButton(tr("显示"));
+    btnPasswordToggle_->setObjectName("BtnGhost");
+    auto* copyPwdBtn = new QPushButton(tr("复制"));
+    copyPwdBtn->setObjectName("BtnGhost");
+    auto* regenBtn = new QPushButton(tr("重置"));
+    regenBtn->setObjectName("BtnGhost");
+    pwdRow->addWidget(btnPasswordToggle_, 0, Qt::AlignBottom);
+    pwdRow->addWidget(copyPwdBtn, 0, Qt::AlignBottom);
+    pwdRow->addWidget(regenBtn, 0, Qt::AlignBottom);
+    vbox->addLayout(pwdRow);
+
+    auto* hint = new QLabel(tr("首次启动会自动生成设备 ID 与密码并保存，可自行修改。"));
     hint->setObjectName("FieldHint");
     vbox->addWidget(hint);
 
     vbox->addSpacing(8);
-    switchForcePwd_ = new QCheckBox(tr("强制密码保护"));
-    switchForcePwd_->setObjectName("Switch");
-    switchForcePwd_->setChecked(true);
-    auto* hint2 = new QLabel(tr("未经授权的连接将被拒绝"));
-    hint2->setObjectName("FieldHint");
-    auto* row = new QVBoxLayout();
-    row->setSpacing(2);
-    row->addWidget(switchForcePwd_);
-    row->addWidget(hint2);
-    vbox->addLayout(row);
+    auto* statusRow = new QHBoxLayout();
+    statusRow->setSpacing(10);
+    hostStatusLabel_ = new QLabel(tr("正在开启…"));
+    hostStatusLabel_->setObjectName("FieldHint");
+    btnHostStart_ = new QPushButton(tr("重新开启"));
+    btnHostStart_->setObjectName("BtnGhost");
+    btnHostStop_ = new QPushButton(tr("停止被控"));
+    btnHostStop_->setObjectName("BtnGhost");
+    statusRow->addWidget(hostStatusLabel_, 1);
+    statusRow->addWidget(btnHostStart_);
+    statusRow->addWidget(btnHostStop_);
+    vbox->addLayout(statusRow);
+
+    connect(copyIdBtn, &QPushButton::clicked, this, &MainWindow::onCopyDeviceId);
+    connect(copyPwdBtn, &QPushButton::clicked, this, &MainWindow::onCopyHostPassword);
+    connect(btnPasswordToggle_, &QPushButton::clicked, this,
+            &MainWindow::onToggleHostPassword);
+    connect(regenBtn, &QPushButton::clicked, this,
+            &MainWindow::onRegenerateHostPassword);
   }
   scroll->addWidget(card1);
 
-  auto* card2 = makeCard(tr("传输加密"));
+  auto* card2 = makeCard(tr("连接远程设备"));
   {
     auto* vbox = static_cast<QVBoxLayout*>(card2->layout());
-    switchAes_ = new QCheckBox(tr("AES-256 加密"));
-    switchAes_->setObjectName("Switch");
-    switchAes_->setChecked(true);
-    auto* h1 = new QLabel(tr("所有帧数据与控制指令均加密传输"));
-    h1->setObjectName("FieldHint");
-    auto* row1 = new QVBoxLayout();
-    row1->setSpacing(2);
-    row1->addWidget(switchAes_);
-    row1->addWidget(h1);
-    vbox->addLayout(row1);
 
-    auto* line = new QFrame();
-    line->setFrameShape(QFrame::HLine);
-    vbox->addWidget(line);
+    auto* relayRow = new QHBoxLayout();
+    relayRow->setSpacing(14);
+    auto* hostCol = new QVBoxLayout();
+    auto* lblHost = new QLabel(tr("中继服务器地址"));
+    lblHost->setObjectName("FieldLabel");
+    editRelayHost_ = new QLineEdit("127.0.0.1");
+    hostCol->addWidget(lblHost);
+    hostCol->addWidget(editRelayHost_);
 
-    switchCertVerify_ = new QCheckBox(tr("证书验证"));
-    switchCertVerify_->setObjectName("Switch");
-    auto* h2 = new QLabel(tr("中继服务器证书校验（防止中间人攻击）"));
-    h2->setObjectName("FieldHint");
-    auto* row2 = new QVBoxLayout();
-    row2->setSpacing(2);
-    row2->addWidget(switchCertVerify_);
-    row2->addWidget(h2);
-    vbox->addLayout(row2);
+    auto* portCol = new QVBoxLayout();
+    auto* lblPort = new QLabel(tr("端口"));
+    lblPort->setObjectName("FieldLabel");
+    spinRelayPort_ = new QSpinBox();
+    spinRelayPort_->setRange(1, 65535);
+    spinRelayPort_->setValue(21116);
+    spinRelayPort_->setMaximumWidth(110);
+    portCol->addWidget(lblPort);
+    portCol->addWidget(spinRelayPort_);
+    relayRow->addLayout(hostCol, 1);
+    relayRow->addLayout(portCol);
+    vbox->addLayout(relayRow);
+
+    vbox->addSpacing(4);
+    auto* lblTarget = new QLabel(tr("被控端设备 ID"));
+    lblTarget->setObjectName("FieldLabel");
+    editTargetId_ = new QLineEdit();
+    editTargetId_->setPlaceholderText(tr("对方程序首页显示的设备 ID"));
+    vbox->addWidget(lblTarget);
+    vbox->addWidget(editTargetId_);
+
+    vbox->addSpacing(4);
+    auto* lblConnectPwd = new QLabel(tr("被控端密码"));
+    lblConnectPwd->setObjectName("FieldLabel");
+    editConnectPassword_ = new QLineEdit();
+    editConnectPassword_->setEchoMode(QLineEdit::Password);
+    editConnectPassword_->setPlaceholderText(tr("对方程序首页显示的连接密码"));
+    vbox->addWidget(lblConnectPwd);
+    vbox->addWidget(editConnectPassword_);
+
+    vbox->addSpacing(8);
+    auto* btnRow = new QHBoxLayout();
+    btnRow->setSpacing(10);
+    btnConnect_ = new QPushButton(tr("连接远程桌面"));
+    btnConnect_->setObjectName("BtnPrimary");
+    btnDisconnect_ = new QPushButton(tr("断开"));
+    btnDisconnect_->setObjectName("BtnGhost");
+    clientStatusLabel_ = new QLabel(tr("未连接"));
+    clientStatusLabel_->setObjectName("FieldHint");
+    clientStatusLabel_->setWordWrap(true);
+    btnRow->addWidget(btnConnect_);
+    btnRow->addWidget(btnDisconnect_);
+    btnRow->addStretch();
+    vbox->addLayout(btnRow);
+    vbox->addWidget(clientStatusLabel_);
   }
   scroll->addWidget(card2);
-
-  auto* btnRow = new QHBoxLayout();
-  btnRow->setSpacing(10);
-  auto* saveBtn = new QPushButton(tr("保存"));
-  saveBtn->setObjectName("BtnPrimary");
-  auto* resetBtn = new QPushButton(tr("重置"));
-  resetBtn->setObjectName("BtnGhost");
-  btnRow->addWidget(saveBtn);
-  btnRow->addWidget(resetBtn);
-  btnRow->addStretch();
-  scroll->addLayout(btnRow);
   scroll->addStretch();
 
-  connect(saveBtn, &QPushButton::clicked, this, &MainWindow::onSaveSettings);
+  connect(btnHostStart_, &QPushButton::clicked, this, &MainWindow::onStartHost);
+  connect(btnHostStop_, &QPushButton::clicked, this, &MainWindow::onStopHost);
+  connect(btnConnect_, &QPushButton::clicked, this, &MainWindow::onStartClient);
+  connect(btnDisconnect_, &QPushButton::clicked, this, &MainWindow::onStopClient);
+  connect(editConnectPassword_, &QLineEdit::returnPressed, this,
+          &MainWindow::onStartClient);
   return panel;
 }
 
@@ -613,13 +738,13 @@ QWidget* MainWindow::buildDisplayPanel() {
     auto* video = static_cast<VideoWidget*>(videoView_);
     connect(fullscreenBtn, &QPushButton::clicked, video, &VideoWidget::toggleFullscreen);
     video->setInputCallback([this](const rc::InputEvent& event) {
-      if (!worker_) return;
+      if (!clientWorker_) return;
       if (event.type == rc::MsgType::InputKey) {
         if (switchKeyboard_ && !switchKeyboard_->isChecked()) return;
       } else if (switchMouse_ && !switchMouse_->isChecked()) {
         return;
       }
-      worker_->sendInput(event);
+      clientWorker_->sendInput(event);
     });
   }
   scroll->addWidget(cardVideo, 1);
@@ -693,46 +818,12 @@ QWidget* MainWindow::buildNetworkPanel() {
   hl->setSpacing(4);
   auto* title = new QLabel(tr("网络"));
   title->setObjectName("PanelTitle");
-  auto* desc = new QLabel(tr("配置中继服务器与连接参数。"));
+  auto* desc = new QLabel(tr("中继地址与被控端信息已在“连接”页配置，这里保留高级连接参数与运行日志。"));
   desc->setObjectName("PanelDesc");
   desc->setWordWrap(true);
   hl->addWidget(title);
   hl->addWidget(desc);
   scroll->addWidget(header);
-
-  auto* card1 = makeCard(tr("中继服务器"));
-  {
-    auto* vbox = static_cast<QVBoxLayout*>(card1->layout());
-    auto* hostRow = new QHBoxLayout();
-    hostRow->setSpacing(14);
-    auto* hostCol = new QVBoxLayout();
-    auto* lblHost = new QLabel(tr("服务器地址"));
-    lblHost->setObjectName("FieldLabel");
-    editRelayHost_ = new QLineEdit("127.0.0.1");
-    hostCol->addWidget(lblHost);
-    hostCol->addWidget(editRelayHost_);
-
-    auto* portCol = new QVBoxLayout();
-    auto* lblPort = new QLabel(tr("端口"));
-    lblPort->setObjectName("FieldLabel");
-    spinRelayPort_ = new QSpinBox();
-    spinRelayPort_->setRange(1, 65535);
-    spinRelayPort_->setValue(21116);
-    portCol->addWidget(lblPort);
-    portCol->addWidget(spinRelayPort_);
-    spinRelayPort_->setMaximumWidth(110);
-    hostRow->addLayout(hostCol, 1);
-    hostRow->addLayout(portCol);
-    vbox->addLayout(hostRow);
-
-    auto* lblSid = new QLabel(tr("设备 ID"));
-    lblSid->setObjectName("FieldLabel");
-    editDeviceId_ = new QLineEdit();
-    editDeviceId_->setPlaceholderText(tr("自动生成"));
-    vbox->addWidget(lblSid);
-    vbox->addWidget(editDeviceId_);
-  }
-  scroll->addWidget(card1);
 
   auto* card2 = makeCard(tr("连接参数"));
   {
@@ -792,15 +883,9 @@ QWidget* MainWindow::buildNetworkPanel() {
 
   auto* btnRow = new QHBoxLayout();
   btnRow->setSpacing(10);
-  auto* hostBtn = new QPushButton(tr("启动被控端（Host）"));
-  hostBtn->setObjectName("BtnPrimary");
-  auto* clientBtn = new QPushButton(tr("连接主控（Client）"));
-  clientBtn->setObjectName("BtnPrimary");
-  auto* stopBtn = new QPushButton(tr("停止"));
-  stopBtn->setObjectName("BtnGhost");
-  btnRow->addWidget(hostBtn);
-  btnRow->addWidget(clientBtn);
-  btnRow->addWidget(stopBtn);
+  auto* saveBtn = new QPushButton(tr("保存设置"));
+  saveBtn->setObjectName("BtnPrimary");
+  btnRow->addWidget(saveBtn);
   btnRow->addStretch();
   scroll->addLayout(btnRow);
 
@@ -813,9 +898,7 @@ QWidget* MainWindow::buildNetworkPanel() {
   scroll->addWidget(logView_);
   scroll->addStretch();
 
-  connect(hostBtn, &QPushButton::clicked, this, &MainWindow::onStartHost);
-  connect(clientBtn, &QPushButton::clicked, this, &MainWindow::onStartClient);
-  connect(stopBtn, &QPushButton::clicked, this, &MainWindow::onStop);
+  connect(saveBtn, &QPushButton::clicked, this, &MainWindow::onSaveSettings);
 
   return panel;
 }
@@ -1007,7 +1090,7 @@ QWidget* MainWindow::buildAboutPanel() {
   scroll->addLayout(btnRow);
   scroll->addStretch();
 
-  connect(disconnectBtn, &QPushButton::clicked, this, &MainWindow::onStop);
+  connect(disconnectBtn, &QPushButton::clicked, this, &MainWindow::onStopClient);
   return panel;
 }
 
@@ -1016,35 +1099,151 @@ void MainWindow::onSaveSettings() {
   if (logView_) logView_->append(tr("设置已保存"));
 }
 
+void MainWindow::ensureDeviceIdentity() {
+  if (editDeviceId_ && editDeviceId_->text().trimmed().isEmpty()) {
+    editDeviceId_->setText(defaultDeviceId());
+  }
+  if (editPassword_ && editPassword_->text().isEmpty()) {
+    editPassword_->setText(randomPassword());
+  }
+  saveSettings();
+}
+
+void MainWindow::autoStartHost() { onStartHost(); }
+
 void MainWindow::onStartHost() {
+  if (!hostWorker_) return;
+  // 先停掉已有会话再重启，避免同一个设备 ID 重复注册。
+  hostWorker_->stop();
+  saveSettings();
+
   rc::SessionConfig cfg;
-  cfg.relay_host = editRelayHost_ ? editRelayHost_->text().toStdString() : "127.0.0.1";
+  cfg.relay_host = editRelayHost_ && !editRelayHost_->text().trimmed().isEmpty()
+                       ? editRelayHost_->text().trimmed().toStdString()
+                       : "127.0.0.1";
   cfg.relay_port = spinRelayPort_ ? static_cast<uint16_t>(spinRelayPort_->value()) : 21116;
-  cfg.device_id = editDeviceId_ ? editDeviceId_->text().toStdString() : kPlatformHostId;
+  cfg.device_id = editDeviceId_ && !editDeviceId_->text().trimmed().isEmpty()
+                      ? editDeviceId_->text().trimmed().toStdString()
+                      : kPlatformFallbackHostId;
+  cfg.alias = kPlatformName;
   cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
   cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
   cfg.capture = kPlatformCapture;
+  cfg.fps = 30;
+  cfg.max_frames = 0;
 
-  QMetaObject::invokeMethod(worker_, "startHost", Qt::QueuedConnection,
+  hostState_ = "connecting";
+  if (hostStatusLabel_) hostStatusLabel_->setText(tr("正在开启被控端…"));
+  updateStatusLabel();
+
+  QMetaObject::invokeMethod(hostWorker_, "startHost", Qt::QueuedConnection,
                             Q_ARG(rc::SessionConfig, cfg));
+}
+
+void MainWindow::onStopHost() {
+  if (!hostWorker_) return;
+  hostWorker_->stop();
+  hostState_ = "closed";
+  if (hostStatusLabel_) hostStatusLabel_->setText(tr("被控端已停止"));
+  updateStatusLabel();
 }
 
 void MainWindow::onStartClient() {
+  if (!clientWorker_) return;
+  const QString target = editTargetId_ ? editTargetId_->text().trimmed() : QString();
+  const QString password = editConnectPassword_ ? editConnectPassword_->text() : QString();
+  if (target.isEmpty()) {
+    if (clientStatusLabel_) clientStatusLabel_->setText(tr("请先输入被控端设备 ID"));
+    if (editTargetId_) editTargetId_->setFocus();
+    return;
+  }
+  if (password.isEmpty()) {
+    if (clientStatusLabel_) clientStatusLabel_->setText(tr("请先输入被控端密码"));
+    if (editConnectPassword_) editConnectPassword_->setFocus();
+    return;
+  }
+
+  clientWorker_->stop();
+  saveSettings();
+
   rc::SessionConfig cfg;
-  cfg.relay_host = editRelayHost_ ? editRelayHost_->text().toStdString() : "127.0.0.1";
+  cfg.relay_host = editRelayHost_ && !editRelayHost_->text().trimmed().isEmpty()
+                       ? editRelayHost_->text().trimmed().toStdString()
+                       : "127.0.0.1";
   cfg.relay_port = spinRelayPort_ ? static_cast<uint16_t>(spinRelayPort_->value()) : 21116;
   cfg.device_id = kPlatformClientId;
-  cfg.target_id = editDeviceId_ ? editDeviceId_->text().toStdString() : kPlatformHostId;
-  cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
+  cfg.target_id = target.toStdString();
+  cfg.password = password.toStdString();
   cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
+  cfg.render = false;
 
-  QMetaObject::invokeMethod(worker_, "startClient", Qt::QueuedConnection,
+  clientState_ = "connecting";
+  if (clientStatusLabel_) clientStatusLabel_->setText(tr("正在连接 %1 …").arg(target));
+  updateStatusLabel();
+
+  QMetaObject::invokeMethod(clientWorker_, "startClient", Qt::QueuedConnection,
                             Q_ARG(rc::SessionConfig, cfg));
 }
 
-void MainWindow::onStop() {
+void MainWindow::onStopClient() {
   if (videoView_) static_cast<VideoWidget*>(videoView_)->releaseAll();
-  if (worker_) worker_->stop();
+  if (clientWorker_) clientWorker_->stop();
+  clientState_ = "closed";
+  if (clientStatusLabel_) clientStatusLabel_->setText(tr("已断开远程连接"));
+  updateStatusLabel();
+}
+
+void MainWindow::onCopyDeviceId() {
+  if (!editDeviceId_) return;
+  QApplication::clipboard()->setText(editDeviceId_->text().trimmed());
+  QToolTip::showText(QCursor::pos(), tr("设备 ID 已复制"));
+}
+
+void MainWindow::onCopyHostPassword() {
+  if (!editPassword_) return;
+  QApplication::clipboard()->setText(editPassword_->text());
+  QToolTip::showText(QCursor::pos(), tr("连接密码已复制"));
+}
+
+void MainWindow::onToggleHostPassword() {
+  if (!editPassword_ || !btnPasswordToggle_) return;
+  const bool hidden = editPassword_->echoMode() == QLineEdit::Password;
+  editPassword_->setEchoMode(hidden ? QLineEdit::Normal : QLineEdit::Password);
+  btnPasswordToggle_->setText(hidden ? tr("隐藏") : tr("显示"));
+}
+
+void MainWindow::onRegenerateHostPassword() {
+  if (!editPassword_) return;
+  editPassword_->setText(randomPassword());
+  onStartHost();
+}
+
+void MainWindow::updateStatusLabel() {
+  if (!statusText_) return;
+  const bool clientActive = !clientState_.isEmpty() && clientState_ != "closed" &&
+                            clientState_ != "idle";
+  if (clientActive) {
+    if (clientState_ == "streaming") statusText_->setText(tr("远程画面传输中"));
+    else if (clientState_ == "connected") statusText_->setText(tr("已连接远程"));
+    else if (clientState_ == "auth_failed") statusText_->setText(tr("远程密码错误"));
+    else if (clientState_ == "retrying") statusText_->setText(tr("等待远程端…"));
+    else statusText_->setText(tr("连接远程中…"));
+    return;
+  }
+  if (hostState_ == "registered") statusText_->setText(tr("本机在线 · 等待连接"));
+  else if (hostState_ == "connected" || hostState_ == "streaming") {
+    statusText_->setText(tr("他人正在控制本机"));
+  } else if (hostState_ == "auth_failed") {
+    statusText_->setText(tr("鉴权失败"));
+  } else if (hostState_ == "closed") {
+    statusText_->setText(tr("被控已停止"));
+  } else if (hostState_ == "connecting") {
+    statusText_->setText(tr("正在连接中继…"));
+  } else if (hostState_ == "retrying") {
+    statusText_->setText(tr("被控重试中…"));
+  } else {
+    statusText_->setText(tr("未连接"));
+  }
 }
 
 void MainWindow::onLogMsg(const QString& tag, const QString& level, const QString& msg) {
@@ -1057,24 +1256,45 @@ void MainWindow::onLogMsg(const QString& tag, const QString& level, const QStrin
   }
 }
 
-void MainWindow::onStatusChanged(const QString& state) {
-  if (statusText_) {
-    if (state == "connected") statusText_->setText(tr("已连接"));
-    else if (state == "registered") statusText_->setText(tr("在线 · 等待连接"));
-    else if (state == "streaming") statusText_->setText(tr("传输中"));
-    else if (state == "closed") statusText_->setText(tr("已断开"));
-    else if (state == "auth_failed") statusText_->setText(tr("认证失败"));
-    else statusText_->setText(state);
+void MainWindow::onHostStatus(const QString& state) {
+  hostState_ = state;
+  if (hostStatusLabel_) {
+    if (state == "connecting") hostStatusLabel_->setText(tr("正在连接中继…"));
+    else if (state == "retrying") hostStatusLabel_->setText(tr("中继未连接 · 自动重试中"));
+    else if (state == "connected") hostStatusLabel_->setText(tr("已连接中继，等待远端接入"));
+    else if (state == "registered") hostStatusLabel_->setText(tr("在线 · 等待远端连接"));
+    else if (state == "streaming") hostStatusLabel_->setText(tr("正在被远端控制"));
+    else if (state == "auth_failed") hostStatusLabel_->setText(tr("密码校验失败，请重试"));
+    else if (state == "closed") hostStatusLabel_->setText(tr("被控端已停止"));
+    else hostStatusLabel_->setText(state);
   }
+  updateStatusLabel();
+}
 
+void MainWindow::onClientStatus(const QString& state) {
+  clientState_ = state;
+  if (clientStatusLabel_) {
+    if (state == "connecting") clientStatusLabel_->setText(tr("正在连接中继…"));
+    else if (state == "connected") clientStatusLabel_->setText(tr("已连接中继，等待画面…"));
+    else if (state == "authing") clientStatusLabel_->setText(tr("正在鉴权…"));
+    else if (state == "streaming") clientStatusLabel_->setText(tr("远程画面传输中"));
+    else if (state == "auth_failed") clientStatusLabel_->setText(tr("被控端密码错误"));
+    else if (state == "retrying") clientStatusLabel_->setText(tr("目标离线，等待被控端上线…"));
+    else if (state == "closed") clientStatusLabel_->setText(tr("远程会话已断开"));
+    else clientStatusLabel_->setText(state);
+  }
+  if (state == "streaming" || state == "connected") {
+    if (panels_) panels_->setCurrentIndex(1);
+  }
   if (badgeConn_) {
-    if (state == "connected" || state == "registered" || state == "streaming") {
-      badgeConn_->setText("● " + statusText_->text());
+    if (state == "connected" || state == "streaming") {
+      badgeConn_->setText("● " + clientStatusLabel_->text());
       badgeConn_->setObjectName("BadgeOk");
       badgeConn_->style()->unpolish(badgeConn_);
       badgeConn_->style()->polish(badgeConn_);
     }
   }
+  updateStatusLabel();
 }
 
 void MainWindow::onProgressUpdated(int frames, qlonglong bytes) {
@@ -1096,9 +1316,18 @@ void MainWindow::onFrameReady(QImage image) {
   static_cast<VideoWidget*>(videoView_)->setFrame(image);
 }
 
-void MainWindow::onWorkerFinished(int rc) {
+void MainWindow::onHostFinished(int rc) {
   Q_UNUSED(rc);
-  if (statusText_) statusText_->setText(tr("已停止"));
+  hostState_ = "closed";
+  if (hostStatusLabel_) hostStatusLabel_->setText(tr("被控端已停止"));
+  updateStatusLabel();
+}
+
+void MainWindow::onClientFinished(int rc) {
+  Q_UNUSED(rc);
+  clientState_ = "closed";
+  if (clientStatusLabel_) clientStatusLabel_->setText(tr("远程会话已结束"));
+  updateStatusLabel();
 }
 
 void MainWindow::saveSettings() {
@@ -1107,9 +1336,8 @@ void MainWindow::saveSettings() {
   s.setValue("relay/port", spinRelayPort_ ? spinRelayPort_->value() : 21116);
   s.setValue("device/id", editDeviceId_ ? editDeviceId_->text() : "");
   s.setValue("security/password", editPassword_ ? editPassword_->text() : "");
-  s.setValue("security/force_pwd", switchForcePwd_ ? switchForcePwd_->isChecked() : false);
-  s.setValue("security/aes", switchAes_ ? switchAes_->isChecked() : true);
-  s.setValue("security/cert_verify", switchCertVerify_ ? switchCertVerify_->isChecked() : true);
+  s.setValue("client/target", editTargetId_ ? editTargetId_->text() : "");
+  s.setValue("client/password", editConnectPassword_ ? editConnectPassword_->text() : "");
   if (comboCodec_) s.setValue("display/codec", comboCodec_->currentData().toString());
   s.setValue("display/auto_bitrate", switchAutoBitrate_ ? switchAutoBitrate_->isChecked() : false);
   s.setValue("network/timeout", sliderTimeout_ ? sliderTimeout_->value() : 30);
@@ -1129,9 +1357,10 @@ void MainWindow::loadSettings() {
   if (spinRelayPort_) spinRelayPort_->setValue(s.value("relay/port", 21116).toInt());
   if (editDeviceId_) editDeviceId_->setText(s.value("device/id", "").toString());
   if (editPassword_) editPassword_->setText(s.value("security/password", "").toString());
-  if (switchForcePwd_) switchForcePwd_->setChecked(s.value("security/force_pwd", false).toBool());
-  if (switchAes_) switchAes_->setChecked(s.value("security/aes", true).toBool());
-  if (switchCertVerify_) switchCertVerify_->setChecked(s.value("security/cert_verify", true).toBool());
+  if (editTargetId_) editTargetId_->setText(s.value("client/target", "").toString());
+  if (editConnectPassword_) {
+    editConnectPassword_->setText(s.value("client/password", "").toString());
+  }
   if (comboCodec_) {
     const QString codec = s.value("display/codec", "h264").toString();
     const int idx = comboCodec_->findData(codec);
@@ -1160,9 +1389,9 @@ void MainWindow::initTrayIcon() {
   trayMenu_ = new QMenu(this);
   QAction* actShow = trayMenu_->addAction(tr("显示主窗口"));
   trayMenu_->addSeparator();
-  QAction* actHost = trayMenu_->addAction(tr("启动被控端"));
-  QAction* actClient = trayMenu_->addAction(tr("启动主控端"));
-  QAction* actStop = trayMenu_->addAction(tr("停止"));
+  QAction* actHost = trayMenu_->addAction(tr("重新开启被控端"));
+  QAction* actClient = trayMenu_->addAction(tr("连接远程设备"));
+  QAction* actStop = trayMenu_->addAction(tr("断开远程"));
   trayMenu_->addSeparator();
   QAction* actQuit = trayMenu_->addAction(tr("退出"));
 
@@ -1180,10 +1409,11 @@ void MainWindow::initTrayIcon() {
   });
   connect(actHost, &QAction::triggered, this, &MainWindow::onStartHost);
   connect(actClient, &QAction::triggered, this, &MainWindow::onStartClient);
-  connect(actStop, &QAction::triggered, this, &MainWindow::onStop);
+  connect(actStop, &QAction::triggered, this, &MainWindow::onStopClient);
   connect(actQuit, &QAction::triggered, this, [this]() {
     saveSettings();
-    if (worker_) worker_->stop();
+    if (hostWorker_) hostWorker_->stop();
+    if (clientWorker_) clientWorker_->stop();
     qApp->quit();
   });
 }

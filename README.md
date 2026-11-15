@@ -75,39 +75,47 @@ cd apps/android
 rc-relay --port 21116
 ```
 
-### 2. 启动被控端
+### 2. Windows / Ubuntu 桌面端
 
-```bash
-# Windows 被控端（持续推流，不限帧数）
-rc-cli host --id win-host --alias "Windows主机" --password 123456 \
-  --relay 127.0.0.1:21116 --fps 30 --frames 0
+启动 `rc-app` 即可，**被控端会自动开启**，无需点击任何按钮：
 
-# Linux 被控端
-rc-cli host --id linux-host --alias "Linux主机" --password 123456 \
-  --relay 127.0.0.1:21116 --capture x11 --fps 30 --frames 0
-```
+- 首次启动自动生成唯一设备 ID（`win-<主机名>` / `linux-<主机名>`）和 8 位连接密码，并保存。
+- 首页「本机（被控端 · 已自动开启）」卡片直接显示这两个值，并提供复制 / 重置。
+- 中继不可达时自动重试，恢复后自动重新注册。
+- 同机可同时作为主控端连接其他设备（被控端与主控端各占独立线程）。
 
-> `--frames 0` 表示持续推流；默认 `--frames 60` 约几秒后自动结束会话，仅用于自测。
+> 也可继续用命令行方式启动被控端（适合无图形界面的服务器）：
+> `rc-cli host --id win-host --password 123456 --relay 127.0.0.1:21116 --frames 0`
+> `--frames 0` 表示持续推流；默认 `--frames 60` 会在几秒后结束会话，仅用于自测。
 
 ### 3. 主控端连接
 
-**桌面 CLI / Qt 应用：**
+远端用户只需要拿到被控端首页显示的 **设备 ID** 与 **密码**（外加中继地址）。
 
-```bash
-rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
-# 或启动 rc-app，在界面填入中继地址、设备 ID、密码
-```
+**桌面 Qt 应用：**
+
+在「连接」页填写中继地址、被控端设备 ID、被控端密码，点击「连接远程桌面」。
 
 **Web 网关：**
 
 ```bash
-rc-web --target win-host --password 123456 --http-port 8080 --relay 127.0.0.1:21116
-# 浏览器打开 http://<本机IP>:8080/
+rc-web --http-port 8080 --relay 127.0.0.1:21116
+# 浏览器打开 http://<本机IP>:8080/，在页面中填写中继地址、被控端设备 ID、密码后连接
 ```
+
+> `--target` / `--password` 可选；不传时网关照常启动，等待浏览器提交被控端信息。
+> 页面右上角「切换设备」会先断开会话，再回到填写页。
+> 相关接口：`POST /api/connect {relay,target,password}`、`POST /api/disconnect`。
 
 **Android：**
 
-安装 `app-debug.apk`，在登录页填入中继地址、设备 ID、密码，连接后即可触控操作远程桌面。
+安装 `app-debug.apk`，在连接页填写中继地址、被控端设备 ID、密码后连接，即可触控操作远程桌面。
+
+**命令行：**
+
+```bash
+rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
+```
 
 ## 协议要点
 

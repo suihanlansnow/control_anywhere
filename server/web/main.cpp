@@ -60,13 +60,16 @@ struct Options {
 
 void print_usage() {
   std::printf(
-      "用法: rc-web --target <被控端设备号> --password <密码>\n"
+      "用法: rc-web [--target <被控端设备号>] [--password <密码>]\n"
       "              [--http-port 8080] [--relay 127.0.0.1:21116]\n"
       "              [--device-id web-client] [--fps 15] [--quality 70]\n"
       "              [--codec h264]\n"
       "\n"
-      "示例: rc-web --target win-host-01 --password 123456 --http-port 8080\n"
-      "      浏览器打开 http://<本机IP>:8080/\n");
+      "--target/--password 可省略：省略时启动后仅提供网页，由浏览器填写\n"
+      "被控端设备 ID 与密码后再建立会话。\n"
+      "\n"
+      "示例: rc-web --http-port 8080\n"
+      "      浏览器打开 http://<本机IP>:8080/ 并填入被控端信息\n");
 }
 
 bool split_host_port(const std::string& text, std::string& host, uint16_t& port) {
@@ -232,6 +235,19 @@ class FrameStore {
     return static_cast<int64_t>(steady_ms() - last_ms_);
   }
 
+  // 切换目标或断开时清掉旧画面，避免新会话建立前短暂显示上一台设备。
+  void clear() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      jpeg_.reset();
+      width_ = 0;
+      height_ = 0;
+      ++seq_;
+      last_ms_ = 0;
+    }
+    cv_.notify_all();
+  }
+
  private:
   std::mutex mutex_;
   std::condition_variable cv_;
@@ -249,6 +265,82 @@ class Gateway {
   }
 
   static constexpr int64_t kIdlePauseMs = 15000;  // 无活动多久后暂停会话
+
+  // 浏览器提交的会话参数。启动时可为空，由 /api/connect 动态设置。
+  struct SessionParams {
+    std::string relay_host;
+    uint16_t relay_port = kDefaultControlPort;
+    std::string target_id;
+    std::string password;
+  };
+
+  // 由网页提交被控端信息后建立会话；relay 为空时使用命令行默认中继。
+  bool connect_session(const std::string& relay, const std::string& target,
+                       const std::string& password, std::string& error) {
+    std::string host = options_.relay_host;
+    uint16_t port = options_.relay_port;
+    if (!relay.empty()) {
+      split_host_port(relay, host, port);
+      if (host.empty() || port == 0) {
+        error = "中继地址格式无效，应为 host:port";
+        return false;
+      }
+    }
+    if (target.empty()) {
+      error = "请输入被控端设备 ID";
+      return false;
+    }
+    if (password.empty()) {
+      error = "请输入被控端密码";
+      return false;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(session_mutex_);
+      session_ = SessionParams{host, port, target, password};
+      configured_ = true;
+      ++session_epoch_;
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      state_ = "connecting";
+    }
+    {
+      std::lock_guard<std::mutex> lock(runner_mutex_);
+      if (runner_) runner_->stop();  // 停止上一台设备的会话
+    }
+    frames_.clear();
+    note_activity();
+    session_cv_.notify_all();
+    RC_LOGI("web", "网页请求连接被控端 " << target << "，中继 " << host << ":" << port);
+    return true;
+  }
+
+  void disconnect_session() {
+    {
+      std::lock_guard<std::mutex> lock(session_mutex_);
+      configured_ = false;
+      ++session_epoch_;
+      session_ = SessionParams{};
+    }
+    {
+      std::lock_guard<std::mutex> lock(runner_mutex_);
+      if (runner_) runner_->stop();
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      state_ = "idle";
+    }
+    frames_.clear();
+    note_activity();
+    session_cv_.notify_all();
+    RC_LOGI("web", "网页断开当前会话");
+  }
+
+  bool configured() {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    return configured_;
+  }
 
   FrameStore& frames() { return frames_; }
   bool stopping() const { return stopping_.load(); }
@@ -281,13 +373,28 @@ class Gateway {
 
   void run() {
     while (!stopping_.load()) {
+      SessionParams params;
+      uint64_t epoch = 0;
+      {
+        std::unique_lock<std::mutex> lock(session_mutex_);
+        if (!configured_) {
+          std::lock_guard<std::mutex> slock(state_mutex_);
+          state_ = "idle";
+        }
+        // 未配置目标时等待网页提交被控端信息，避免无意义地连中继。
+        session_cv_.wait(lock, [this] { return configured_ || stopping_.load(); });
+        if (stopping_.load()) break;
+        params = session_;
+        epoch = session_epoch_;
+      }
+
       SessionConfig cfg;
-      cfg.relay_host = options_.relay_host;
-      cfg.relay_port = options_.relay_port;
+      cfg.relay_host = params.relay_host;
+      cfg.relay_port = params.relay_port;
       cfg.device_id = options_.device_id;
       cfg.alias = options_.alias;
-      cfg.target_id = options_.target_id;
-      cfg.password = options_.password;
+      cfg.target_id = params.target_id;
+      cfg.password = params.password;
       cfg.codec = options_.codec;
       // 按 Web 实际需要的帧率协商，被控端据此降帧编码，避免解码端空转。
       cfg.fps = options_.fps;
@@ -320,6 +427,12 @@ class Gateway {
         runner_ = nullptr;
       }
       if (stopping_.load()) break;
+
+      // 期间被断开或更换了目标：丢弃旧结果，按新参数重建会话。
+      {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (!configured_ || session_epoch_ != epoch) continue;
+      }
 
       // 无人使用时暂停会话，直到新请求唤醒，避免解码链路空转。
       if (steady_ms() - last_activity_ms_.load() > kIdlePauseMs) {
@@ -403,12 +516,24 @@ class Gateway {
       state = state_;
     }
 
+    SessionParams params;
+    bool connected = false;
+    {
+      std::lock_guard<std::mutex> lock(session_mutex_);
+      connected = configured_;
+      params = session_;
+    }
+
     Snapshot snap;
     const bool has_frame = frames_.latest(snap);
     const int64_t age = frames_.age_ms();
 
     json::Value out = json::Value::make_object();
-    out.set("target", options_.target_id);
+    out.set("connected", connected);
+    out.set("target", params.target_id);
+    out.set("relay", params.relay_host + ":" + std::to_string(params.relay_port));
+    out.set("relay_default", options_.relay_host + ":" +
+                                 std::to_string(options_.relay_port));
     out.set("state", state);
     out.set("streaming", state == "streaming" && has_frame);
     out.set("width", has_frame ? snap.width : 0);
@@ -529,6 +654,13 @@ class Gateway {
   FrameStore frames_;
   RawFrameSlot raw_;
 
+  // 网页提交的会话参数；configured_ 为 false 时 run() 在条件变量上等待。
+  std::mutex session_mutex_;
+  std::condition_variable session_cv_;
+  SessionParams session_;
+  bool configured_ = false;
+  uint64_t session_epoch_ = 0;
+
   std::mutex runner_mutex_;
   ClientRunner* runner_ = nullptr;
   std::atomic<bool> stopping_{false};
@@ -639,14 +771,41 @@ void bind_routes(HttpServer& server, Gateway& gateway) {
     return http_write_response(socket, 200, "application/json",
                                ok ? "{\"ok\":true}" : "{\"ok\":false}");
   });
+
+  // 网页提交被控端信息后建立会话；密码只保存在内存中，断开即清空。
+  server.route("/api/connect", [&gateway](const HttpRequest& request, TcpSocket& socket) {
+    gateway.note_activity();
+    bool ok = false;
+    std::string error = "请求格式错误";
+    try {
+      const json::Value value = json::Value::parse(request.body);
+      auto text = [&value](const char* key) {
+        const json::Value* field = value.get(key);
+        return field ? field->as_string() : std::string();
+      };
+      ok = gateway.connect_session(text("relay"), text("target"), text("password"),
+                                   error);
+    } catch (const std::exception&) {
+      ok = false;
+    }
+    json::Value out = json::Value::make_object();
+    out.set("ok", ok);
+    if (!ok) out.set("error", error);
+    return http_write_response(socket, 200, "application/json", out.dump());
+  });
+
+  server.route("/api/disconnect", [&gateway](const HttpRequest&, TcpSocket& socket) {
+    gateway.note_activity();
+    gateway.disconnect_session();
+    return http_write_response(socket, 200, "application/json", "{\"ok\":true}");
+  });
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   Options options;
-  if (!parse_options(argc, argv, options) || options.target_id.empty() ||
-      options.password.empty()) {
+  if (!parse_options(argc, argv, options)) {
     print_usage();
     return 1;
   }
@@ -666,9 +825,22 @@ int main(int argc, char** argv) {
   gateway.start();
   std::thread([&gateway] { gateway.run(); }).detach();
 
-  RC_LOGI("web", "网页控制台 http://127.0.0.1:" << options.http_port
-                              << "  目标=" << options.target_id << "  中继="
-                              << options.relay_host << ":" << options.relay_port);
+  // 兼容旧用法：命令行显式给出目标时启动即连接；否则等待浏览器提交。
+  if (!options.target_id.empty() && !options.password.empty()) {
+    std::string err;
+    if (!gateway.connect_session("", options.target_id, options.password, err)) {
+      RC_LOGW("web", "命令行指定的会话无效：" << err);
+    }
+  }
+
+  if (options.target_id.empty()) {
+    RC_LOGI("web", "网页控制台 http://127.0.0.1:" << options.http_port
+                                << "  等待浏览器填写被控端信息");
+  } else {
+    RC_LOGI("web", "网页控制台 http://127.0.0.1:" << options.http_port
+                                << "  目标=" << options.target_id << "  中继="
+                                << options.relay_host << ":" << options.relay_port);
+  }
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);

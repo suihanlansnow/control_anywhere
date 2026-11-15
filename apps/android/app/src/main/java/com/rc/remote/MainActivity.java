@@ -29,6 +29,7 @@ public final class MainActivity extends Activity {
     private static final int DARK = Color.rgb(32, 33, 36);
     private static final int CONTROL = Color.rgb(60, 64, 67);
     private static final int ACCENT = Color.rgb(25, 118, 210);
+    private static final int ERROR = Color.rgb(180, 40, 40);
 
     private FrameLayout root;
     private View loginView;
@@ -104,7 +105,7 @@ public final class MainActivity extends Activity {
         content.addView(title, margins(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0, 0, 8));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("连接 Windows / Ubuntu 被控端");
+        subtitle.setText("只需输入被控端的设备 ID 与密码");
         subtitle.setTextSize(16);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setGravity(Gravity.CENTER);
@@ -112,9 +113,21 @@ public final class MainActivity extends Activity {
 
         relayInput = addField(content, "中继地址", "中继 IP 或域名:21116",
                 preferences.getString("relay", "127.0.0.1:21116"), false);
-        targetInput = addField(content, "被控设备 ID", "HostRunner 注册的设备 ID",
+        targetInput = addField(content, "被控端设备 ID", "被控端程序首页显示的设备 ID",
                 preferences.getString("target", ""), false);
-        passwordInput = addField(content, "远程访问密码", "不会被保存", "", true);
+        passwordInput = addField(content, "被控端密码", "被控端程序首页显示的连接密码", "", true);
+
+        final String savedTarget = preferences.getString("target", "");
+        if (!savedTarget.isEmpty()) {
+            TextView recent = new TextView(this);
+            recent.setText("上次连接：" + savedTarget + "（点击填入）");
+            recent.setTextSize(13);
+            recent.setTextColor(ACCENT);
+            recent.setPadding(0, dp(6), 0, 0);
+            recent.setOnClickListener(v -> targetInput.setText(savedTarget));
+            content.addView(recent, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
 
         connectButton = new Button(this);
         connectButton.setText("连接远程桌面");
@@ -275,12 +288,18 @@ public final class MainActivity extends Activity {
         try {
             address = HostPort.parse(relay);
         } catch (IllegalArgumentException e) {
-            loginStatus.setText(e.getMessage());
+            setLoginStatus(e.getMessage(), true);
+            relayInput.requestFocus();
             return;
         }
         if (target.isEmpty()) {
-            loginStatus.setText("请输入被控设备 ID");
+            setLoginStatus("请输入被控端设备 ID", true);
             targetInput.requestFocus();
+            return;
+        }
+        if (password.isEmpty()) {
+            setLoginStatus("请输入被控端密码", true);
+            passwordInput.requestFocus();
             return;
         }
 
@@ -291,6 +310,9 @@ public final class MainActivity extends Activity {
         resetModifiers(false);
         surface.setRightButtonMode(false);
         remoteStatus.setText("正在连接…");
+        connectButton.setEnabled(false);
+        connectButton.setText("正在连接…");
+        setLoginStatus("正在连接 " + target + " …", false);
         loginView.setVisibility(View.GONE);
         remoteView.setVisibility(View.VISIBLE);
         showingRemote = true;
@@ -342,9 +364,14 @@ public final class MainActivity extends Activity {
         remoteView.setVisibility(View.GONE);
         loginView.setVisibility(View.VISIBLE);
         connectButton.setEnabled(true);
-        loginStatus.setText(status);
-        loginStatus.setTextColor(status.startsWith("连接结束") || status.startsWith("H.264")
-                ? Color.rgb(180, 40, 40) : Color.DKGRAY);
+        connectButton.setText("连接远程桌面");
+        boolean error = status.startsWith("连接结束") || status.startsWith("H.264");
+        setLoginStatus(status, error);
+    }
+
+    private void setLoginStatus(String text, boolean error) {
+        loginStatus.setText(text);
+        loginStatus.setTextColor(error ? ERROR : Color.DKGRAY);
     }
 
     private void showKeyboard() {

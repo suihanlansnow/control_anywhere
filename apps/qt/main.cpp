@@ -5,6 +5,7 @@
 
 int main(int argc, char* argv[]) {
   QApplication app(argc, argv);
+  app.setOrganizationName("rc");
   app.setApplicationName("远程控制");
   app.setApplicationVersion("0.1.0");
   qRegisterMetaType<rc::SessionConfig>("rc::SessionConfig");

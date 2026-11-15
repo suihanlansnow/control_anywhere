@@ -68,14 +68,61 @@ const char* web_page_html() {
     background: #232833; border: 1px solid var(--line); border-bottom-width: 2px;
     border-radius: 4px; padding: 0 5px; color: var(--text); font-size: 11px;
   }
+
+  /* 连接表单：未提交被控端信息前覆盖整个页面。 */
+  #login {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 50% 28%, #1b2130, #0e1014 70%);
+  }
+  #login.hidden { display: none; }
+  .login-card {
+    width: min(400px, 92vw); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 12px; padding: 26px 24px;
+    display: flex; flex-direction: column; gap: 8px;
+    box-shadow: 0 18px 48px rgba(0,0,0,.45);
+  }
+  .login-card h1 { margin: 0; font-size: 21px; font-weight: 600; }
+  .login-card h1 span { color: var(--accent); }
+  .login-card p { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+  .login-card label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .login-card input {
+    width: 100%; padding: 9px 11px; border-radius: 6px;
+    border: 1px solid var(--line); background: #0f1218;
+    color: var(--text); font-size: 14px; outline: none;
+  }
+  .login-card input:focus { border-color: var(--accent); }
+  #connectBtn {
+    margin-top: 10px; padding: 10px; border: none; border-radius: 6px;
+    background: var(--accent); color: #08120c; font-weight: 600; font-size: 14px;
+  }
+  #connectBtn:disabled { opacity: .6; cursor: default; }
+  #loginError { min-height: 17px; color: #e5534b; font-size: 12px; }
 </style>
 </head>
-<body>
+<body>)HTML"
+// MSVC 单个字符串字面量上限约 16KB，这里按段拼接，避免 C2026 截断。
+R"HTML(
+<div id="login">
+  <form class="login-card" id="loginForm" autocomplete="off">
+    <h1>远程控制 <span>Web</span></h1>
+    <p>输入被控端信息后即可连接，无需在服务端配置目标。</p>
+    <label for="relayInput">中继服务器地址</label>
+    <input id="relayInput" placeholder="中继 IP 或域名:端口" />
+    <label for="targetInput">被控端设备 ID</label>
+    <input id="targetInput" placeholder="被控端程序首页显示的设备 ID" />
+    <label for="passwordInput">被控端密码</label>
+    <input id="passwordInput" type="password" placeholder="被控端程序首页显示的连接密码" />
+    <div id="loginError"></div>
+    <button id="connectBtn" type="submit">连接远程桌面</button>
+  </form>
+</div>
 <header>
   <div class="brand">远程控制 <span>Web</span></div>
-  <div class="pill"><span id="dot" class="dot"></span><span id="stateText">连接中…</span></div>
+  <div class="pill"><span id="dot" class="dot"></span><span id="stateText">未连接</span></div>
   <div class="meta" id="meta">--</div>
   <div class="spacer"></div>
+  <button id="switchBtn">切换设备</button>
   <button id="kbBtn" aria-pressed="true">键盘：开</button>
   <button id="fsBtn">全屏</button>
 </header>
@@ -84,7 +131,7 @@ const char* web_page_html() {
     <img id="screen" alt="远程画面" />
     <div id="overlay">
       <strong>等待远程画面</strong>
-      <span id="overlayText">正在连接被控端…</span>
+      <span id="overlayText">请先填写被控端信息</span>
     </div>
   </div>
 </main>
@@ -92,7 +139,8 @@ const char* web_page_html() {
   <span>左键 / 右键 / 滚轮直接作用于远程桌面</span>
   <span>键盘需保持本页面为前台窗口</span>
   <span><kbd>Ctrl</kbd>+<kbd>W</kbd> 等浏览器级快捷键无法转发</span>
-</footer>
+</footer>)HTML"
+R"HTML(
 <script>
 (function () {
   const img = document.getElementById('screen');
@@ -104,14 +152,25 @@ const char* web_page_html() {
   const meta = document.getElementById('meta');
   const kbBtn = document.getElementById('kbBtn');
   const fsBtn = document.getElementById('fsBtn');
+  const switchBtn = document.getElementById('switchBtn');
+  const login = document.getElementById('login');
+  const loginForm = document.getElementById('loginForm');
+  const relayInput = document.getElementById('relayInput');
+  const targetInput = document.getElementById('targetInput');
+  const passwordInput = document.getElementById('passwordInput');
+  const loginError = document.getElementById('loginError');
+  const connectBtn = document.getElementById('connectBtn');
 
   const STATE_TEXT = {
-    connecting: '连接中…', connected: '已连接中继', registered: '已注册',
-    authing: '鉴权中…', streaming: '画面传输中', retrying: '等待被控端…',
-    auth_failed: '密码错误', closed: '会话已关闭', offline: '被控端离线'
+    idle: '未连接', connecting: '连接中…', connected: '已连接中继',
+    registered: '已注册', authing: '鉴权中…', streaming: '画面传输中',
+    retrying: '等待被控端…', paused: '已暂停', auth_failed: '密码错误',
+    closed: '会话已关闭', offline: '被控端离线'
   };
 
   let kbEnabled = true;
+  let streaming = false;
+  let connected = false;
   let lastPoint = { x: 0, y: 0 };
   let lastMoveSent = 0;
   let pendingMove = null;
@@ -119,8 +178,16 @@ const char* web_page_html() {
   let wheelDx = 0;
   let wheelDy = 0;
   let wheelTimer = 0;
+  let relayDefaulted = false;
   const pressedButtons = new Set();
   const pressedKeys = new Set();
+
+  try {
+    const savedRelay = localStorage.getItem('rc_relay');
+    const savedTarget = localStorage.getItem('rc_target');
+    if (savedRelay) relayInput.value = savedRelay;
+    if (savedTarget) targetInput.value = savedTarget;
+  } catch (e) {}
 
   function post(payload) {
     fetch('/input', {
@@ -165,11 +232,13 @@ const char* web_page_html() {
   }
 
   stage.addEventListener('pointermove', function (event) {
+    if (!connected) return;
     const point = remotePoint(event.clientX, event.clientY);
     if (point) queueMove(point);
   });
 
   stage.addEventListener('pointerdown', function (event) {
+    if (!connected) return;
     const point = remotePoint(event.clientX, event.clientY);
     if (!point) return;
     if (stage.setPointerCapture) {
@@ -189,6 +258,7 @@ const char* web_page_html() {
                  : event.button === 2 ? 2 : 0;
     if (!button) return;
     pressedButtons.delete(button);
+    if (!connected) return;
     post({ type: 'button', button: button, state: 0,
            x: lastPoint.x, y: lastPoint.y });
     event.preventDefault();
@@ -200,6 +270,7 @@ const char* web_page_html() {
   // 否则每个事件都占一条输入消息，被控端会排队造成"卡住"的错觉。
   stage.addEventListener('wheel', function (event) {
     event.preventDefault();
+    if (!connected) return;
     wheelDx += event.deltaX ? Math.sign(event.deltaX) * 120 : 0;
     wheelDy += event.deltaY ? Math.sign(event.deltaY) * 120 : 0;
     if (wheelTimer) return;
@@ -259,7 +330,7 @@ const char* web_page_html() {
   }
 
   window.addEventListener('keydown', function (event) {
-    if (!kbEnabled) return;
+    if (!kbEnabled || !connected) return;
     const key = qtKey(event);
     if (!key) return;
     event.preventDefault();
@@ -273,7 +344,7 @@ const char* web_page_html() {
   });
 
   window.addEventListener('keyup', function (event) {
-    if (!kbEnabled) return;
+    if (!kbEnabled || !connected) return;
     const key = qtKey(event);
     if (!key) return;
     event.preventDefault();
@@ -309,12 +380,80 @@ const char* web_page_html() {
     clearTimeout(streamTimer);
     img.src = '/stream?t=' + Date.now();
   }
+  function stopStream() {
+    clearTimeout(streamTimer);
+    img.removeAttribute('src');
+  }
   img.addEventListener('error', function () {
+    if (!streaming) return;
     overlay.classList.remove('hidden');
     overlayText.textContent = '画面中断，正在重连…';
     streamTimer = setTimeout(startStream, 1000);
   });
-  startStream();
+
+  function showLogin(message) {
+    connected = false;
+    streaming = false;
+    stopStream();
+    login.classList.remove('hidden');
+    passwordInput.value = '';
+    loginError.textContent = message || '';
+    overlay.classList.remove('hidden');
+    overlayText.textContent = '请先填写被控端信息';
+    dot.classList.remove('on');
+    stateText.textContent = '未连接';
+    meta.textContent = '--';
+    if (!targetInput.value) targetInput.focus();
+    else passwordInput.focus();
+  }
+
+  loginForm.addEventListener('submit', async function (event) {
+    event.preventDefault();
+    const relay = relayInput.value.trim();
+    const target = targetInput.value.trim();
+    const password = passwordInput.value;
+    if (!target) { loginError.textContent = '请输入被控端设备 ID'; return; }
+    if (!password) { loginError.textContent = '请输入被控端密码'; return; }
+
+    connectBtn.disabled = true;
+    connectBtn.textContent = '连接中…';
+    loginError.textContent = '';
+    try {
+      const response = await fetch('/api/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ relay: relay, target: target, password: password })
+      });
+      const data = await response.json();
+      if (!data.ok) {
+        loginError.textContent = data.error || '连接失败';
+        return;
+      }
+      try {
+        localStorage.setItem('rc_relay', relay);
+        localStorage.setItem('rc_target', target);
+      } catch (e) {}
+      connected = true;
+      login.classList.add('hidden');
+      overlay.classList.remove('hidden');
+      overlayText.textContent = '正在连接被控端…';
+      streaming = true;
+      startStream();
+    } catch (e) {
+      loginError.textContent = '无法连接网关，请检查服务是否运行';
+    } finally {
+      connectBtn.disabled = false;
+      connectBtn.textContent = '连接远程桌面';
+    }
+  });
+
+  switchBtn.addEventListener('click', async function () {
+    releaseAll();
+    try {
+      await fetch('/api/disconnect', { method: 'POST' });
+    } catch (e) {}
+    showLogin('');
+  });
 
   async function poll() {
     let alive = false;
@@ -322,21 +461,46 @@ const char* web_page_html() {
       const response = await fetch('/status', { cache: 'no-store' });
       const status = await response.json();
       alive = true;
-      const streaming = !!status.streaming && status.age_ms < 4000;
-      dot.classList.toggle('on', streaming);
+
+      if (!relayDefaulted && status.relay_default) {
+        relayDefaulted = true;
+        if (!relayInput.value) relayInput.value = status.relay_default;
+      }
+
+      if (!status.connected) {
+        if (!login.classList.contains('hidden')) {
+          // 已经显示表单，只更新状态文字，避免打断输入。
+          dot.classList.remove('on');
+          stateText.textContent = '未连接';
+          meta.textContent = '--';
+        } else {
+          showLogin('');
+        }
+        setTimeout(poll, 1000);
+        return;
+      }
+
+      login.classList.add('hidden');
+      if (!streaming) {
+        streaming = true;
+        startStream();
+      }
+
+      const isStreaming = !!status.streaming && status.age_ms < 4000;
+      dot.classList.toggle('on', isStreaming);
       stateText.textContent = STATE_TEXT[status.state] || status.state || '未知';
       if (status.width > 0) {
-        meta.textContent = status.width + '×' + status.height + ' · '
-          + status.fps + ' fps · ' + status.viewers + ' 观看';
+        meta.textContent = status.target + ' · ' + status.width + '×' + status.height
+          + ' · ' + status.fps + ' fps · ' + status.viewers + ' 观看';
       } else {
-        meta.textContent = '--';
+        meta.textContent = status.target || '--';
       }
-      if (streaming) {
+      if (isStreaming) {
         overlay.classList.add('hidden');
       } else {
         overlay.classList.remove('hidden');
         overlayText.textContent = status.state === 'auth_failed'
-          ? '密码校验失败，请检查 rc-web 启动参数 --password'
+          ? '密码校验失败，请切换设备后重新输入密码'
           : '正在等待被控端画面…';
       }
     } catch (e) {

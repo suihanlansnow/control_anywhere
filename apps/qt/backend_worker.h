@@ -2,6 +2,7 @@
 
 #include <QImage>
 #include <QObject>
+#include <atomic>
 #include <memory>
 #include <mutex>
 
@@ -38,4 +39,6 @@ class BackendWorker : public QObject {
   std::mutex runner_mutex_;
   std::unique_ptr<rc::HostRunner> host_;
   std::unique_ptr<rc::ClientRunner> client_;
+  // 被控端在中继不可达时自动重试，stop() 置位后退出重试循环。
+  std::atomic<bool> stopping_{false};
 };
