@@ -608,6 +608,19 @@ QWidget* MainWindow::buildConnectPanel() {
     vbox->addWidget(hint);
 
     vbox->addSpacing(8);
+    auto* inputRow = new QVBoxLayout();
+    inputRow->setSpacing(2);
+    switchRemoteInput_ = new QCheckBox(tr("允许远程键鼠操作"));
+    switchRemoteInput_->setObjectName("Switch");
+    switchRemoteInput_->setChecked(true);
+    auto* inputHint = new QLabel(tr("取消勾选后进入仅观看模式：远端仍能看到画面，但鼠标和键盘不会生效"));
+    inputHint->setObjectName("FieldHint");
+    inputHint->setWordWrap(true);
+    inputRow->addWidget(switchRemoteInput_);
+    inputRow->addWidget(inputHint);
+    vbox->addLayout(inputRow);
+
+    vbox->addSpacing(8);
     auto* statusRow = new QHBoxLayout();
     statusRow->setSpacing(10);
     hostStatusLabel_ = new QLabel(tr("正在开启…"));
@@ -627,6 +640,19 @@ QWidget* MainWindow::buildConnectPanel() {
             &MainWindow::onToggleHostPassword);
     connect(regenBtn, &QPushButton::clicked, this,
             &MainWindow::onRegenerateHostPassword);
+    connect(switchRemoteInput_, &QCheckBox::toggled, this, [this](bool enabled) {
+      // 被控线程正阻塞在 run() 中，排队调用不会被执行，这里直接调用：
+      // setInputEnabled 只写原子变量并在锁内调用 runner，不会阻塞 UI。
+      if (hostWorker_) hostWorker_->setInputEnabled(enabled);
+      if (hostStatusLabel_ && hostState_ == "streaming") {
+        hostStatusLabel_->setText(enabled ? tr("正在被远端控制")
+                                          : tr("远端正在观看 · 键鼠已禁用"));
+      }
+      if (logView_) {
+        logView_->append(enabled ? tr("已允许远程键鼠操作")
+                                 : tr("已切换为仅观看模式（远程键鼠已禁用）"));
+      }
+    });
   }
   scroll->addWidget(card1);
 
@@ -1232,7 +1258,11 @@ void MainWindow::updateStatusLabel() {
   }
   if (hostState_ == "registered") statusText_->setText(tr("本机在线 · 等待连接"));
   else if (hostState_ == "connected" || hostState_ == "streaming") {
-    statusText_->setText(tr("他人正在控制本机"));
+    if (switchRemoteInput_ && !switchRemoteInput_->isChecked()) {
+      statusText_->setText(tr("他人正在观看本机（仅观看）"));
+    } else {
+      statusText_->setText(tr("他人正在控制本机"));
+    }
   } else if (hostState_ == "auth_failed") {
     statusText_->setText(tr("鉴权失败"));
   } else if (hostState_ == "closed") {
@@ -1263,7 +1293,11 @@ void MainWindow::onHostStatus(const QString& state) {
     else if (state == "retrying") hostStatusLabel_->setText(tr("中继未连接 · 自动重试中"));
     else if (state == "connected") hostStatusLabel_->setText(tr("已连接中继，等待远端接入"));
     else if (state == "registered") hostStatusLabel_->setText(tr("在线 · 等待远端连接"));
-    else if (state == "streaming") hostStatusLabel_->setText(tr("正在被远端控制"));
+    else if (state == "streaming") {
+      hostStatusLabel_->setText(switchRemoteInput_ && !switchRemoteInput_->isChecked()
+                                    ? tr("远端正在观看 · 键鼠已禁用")
+                                    : tr("正在被远端控制"));
+    }
     else if (state == "auth_failed") hostStatusLabel_->setText(tr("密码校验失败，请重试"));
     else if (state == "closed") hostStatusLabel_->setText(tr("被控端已停止"));
     else hostStatusLabel_->setText(state);

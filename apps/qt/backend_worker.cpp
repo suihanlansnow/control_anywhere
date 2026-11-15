@@ -14,6 +14,7 @@ void BackendWorker::startHost(const rc::SessionConfig& cfg) {
     {
       std::lock_guard<std::mutex> lock(runner_mutex_);
       host_ = std::make_unique<rc::HostRunner>(cfg);
+      host_->set_input_enabled(input_enabled_.load());
     }
     host_->set_log_callback([this](const std::string& tag, const std::string& level, const std::string& msg) {
       emit logMessage(QString::fromStdString(tag),
@@ -92,4 +93,10 @@ void BackendWorker::stop() {
   std::lock_guard<std::mutex> lock(runner_mutex_);
   if (host_) host_->stop();
   if (client_) client_->stop();
+}
+
+void BackendWorker::setInputEnabled(bool enabled) {
+  input_enabled_.store(enabled);
+  std::lock_guard<std::mutex> lock(runner_mutex_);
+  if (host_) host_->set_input_enabled(enabled);
 }

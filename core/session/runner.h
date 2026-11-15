@@ -42,6 +42,10 @@ class HostRunner {
   void set_status_callback(StatusCallback cb) { status_cb_ = std::move(cb); }
   void set_progress_callback(ProgressCallback cb) { progress_cb_ = std::move(cb); }
 
+  // 临时关闭远程键鼠注入，会话保持连接、继续推流，仅允许观看。
+  void set_input_enabled(bool enabled);
+  bool input_enabled() const { return input_enabled_.load(); }
+
   int run();
   void stop();
 
@@ -51,6 +55,7 @@ class HostRunner {
 
   SessionConfig cfg_;
   std::atomic<bool> stop_flag_{false};
+  std::atomic<bool> input_enabled_{true};
   std::atomic<int> requested_fps_{0};  // 主控在会话邀请里协商的 max_fps
   LogCallback log_cb_;
   StatusCallback status_cb_;

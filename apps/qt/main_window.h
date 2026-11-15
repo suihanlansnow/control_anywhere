@@ -81,6 +81,7 @@ class MainWindow : public QMainWindow {
   QLabel* hostStatusLabel_ = nullptr;
   QPushButton* btnHostStart_ = nullptr;
   QPushButton* btnHostStop_ = nullptr;
+  QCheckBox* switchRemoteInput_ = nullptr;
 
   // 连接远程设备
   QLineEdit* editRelayHost_ = nullptr;

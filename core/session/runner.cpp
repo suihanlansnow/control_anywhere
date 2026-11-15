@@ -132,6 +132,12 @@ HostRunner::~HostRunner() { stop(); }
 
 void HostRunner::stop() { stop_flag_.store(true); }
 
+void HostRunner::set_input_enabled(bool enabled) {
+  if (input_enabled_.exchange(enabled) == enabled) return;
+  log_("INFO", "input",
+       enabled ? "remote keyboard/mouse enabled" : "remote keyboard/mouse disabled (view only)");
+}
+
 void HostRunner::log_(const std::string& level, const std::string& tag, const std::string& msg) {
   if (log_cb_) {
     log_cb_(tag, level, msg);
@@ -268,6 +274,10 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
       }
       if (incoming.session_id != session_id) continue;
 #if defined(__linux__) || defined(_WIN32)
+      if (!input_enabled_.load()) {
+        // 仅观看模式：消息照常消费，但不下发到注入器。
+        continue;
+      }
       switch (incoming.type) {
         case MsgType::InputMouseMove:
           if (incoming.payload.size() >= 10) {
