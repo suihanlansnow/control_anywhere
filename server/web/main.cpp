@@ -191,8 +191,8 @@ struct Snapshot {
 // 最新 JPEG 帧槽：多个浏览器同时观看时共享同一份数据，新帧到达唤醒所有等待者。
 class FrameStore {
  public:
-  void publish(std::vector<uint8_t> data, int width, int height) {
-    auto jpeg = std::make_shared<const std::vector<uint8_t>>(std::move(data));
+  void publish(std::shared_ptr<const std::vector<uint8_t>> jpeg, int width,
+               int height) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       jpeg_ = std::move(jpeg);
@@ -244,12 +244,23 @@ class FrameStore {
 
 class Gateway {
  public:
-  explicit Gateway(const Options& options) : options_(options) {}
+  explicit Gateway(const Options& options) : options_(options) {
+    last_activity_ms_.store(steady_ms());
+  }
+
+  static constexpr int64_t kIdlePauseMs = 15000;  // 无活动多久后暂停会话
 
   FrameStore& frames() { return frames_; }
   bool stopping() const { return stopping_.load(); }
 
   void add_viewer(int delta) { viewers_.fetch_add(delta); }
+
+  // 任何 HTTP 请求（页面、状态、推流、输入）都视为"有人在使用"，
+  // 用于无人使用时暂停视频会话，避免解码链路空转。
+  void note_activity() {
+    last_activity_ms_.store(steady_ms());
+    pause_cv_.notify_all();
+  }
 
   // 编码线程独占 WIC/ffmpeg 编码器及其 COM apartment。ClientRunner 每次重连都会
   // 新建解码线程并在结束时 CoUninitialize，如果把编码器放在解码线程里复用，
@@ -309,6 +320,22 @@ class Gateway {
         runner_ = nullptr;
       }
       if (stopping_.load()) break;
+
+      // 无人使用时暂停会话，直到新请求唤醒，避免解码链路空转。
+      if (steady_ms() - last_activity_ms_.load() > kIdlePauseMs) {
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          state_ = "paused";
+        }
+        RC_LOGI("web", "无活动超过 15 秒，暂停视频会话");
+        std::unique_lock<std::mutex> lock(pause_mutex_);
+        while (!stopping_.load() &&
+               steady_ms() - last_activity_ms_.load() > kIdlePauseMs) {
+          pause_cv_.wait_for(lock, std::chrono::seconds(3));
+        }
+        RC_LOGI("web", "检测到新请求，恢复视频会话");
+        continue;  // 立即重建会话，不走重试延迟
+      }
 
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -416,8 +443,41 @@ class Gateway {
     int width = 0;
     int height = 0;
 
+    auto publish_and_count = [&](std::shared_ptr<const std::vector<uint8_t>> jpeg) {
+      frames_.publish(std::move(jpeg), width, height);
+      frames_published_.fetch_add(1);
+      ++window_frames_;
+      const auto now = std::chrono::steady_clock::now();
+      if (now - fps_window_ >= std::chrono::seconds(1)) {
+        measured_fps_.store(window_frames_);
+        window_frames_ = 0;
+        fps_window_ = now;
+      }
+    };
+
     while (!raw_.stopped()) {
+      // 无人使用超过阈值则停止会话，run() 检测到后进入暂停等待。
+      if (steady_ms() - last_activity_ms_.load() > kIdlePauseMs) {
+        std::lock_guard<std::mutex> lock(runner_mutex_);
+        if (runner_) runner_->stop();
+      }
       if (!raw_.wait_next(seq, buffer, width, height, 500)) continue;
+
+      // 无人观看时降到 2fps，仅维持 /snapshot 可用，避免空转。
+      const auto now_tp = std::chrono::steady_clock::now();
+      if (viewers_.load() == 0 && encoded_once_ &&
+          now_tp - last_encode_tp_ < std::chrono::milliseconds(500)) {
+        continue;
+      }
+
+      // 帧去重：画面与上一帧完全一致时复用 JPEG，跳过编码。
+      // 远程桌面大量时间静止，能省掉绝大部分 JPEG 开销；memcmp 比编码便宜约 50 倍。
+      if (last_jpeg_ && width == last_width_ && height == last_height_ &&
+          last_bgra_.size() == buffer.size() &&
+          std::memcmp(last_bgra_.data(), buffer.data(), buffer.size()) == 0) {
+        publish_and_count(last_jpeg_);
+        continue;
+      }
 
       if (!encoder_ || encoder_width_ != width || encoder_height_ != height) {
         encoder_.reset();
@@ -452,16 +512,16 @@ class Gateway {
         RC_LOGW("web", "JPEG 编码失败: " << error);
         continue;
       }
-      frames_.publish(std::move(encoded.data), width, height);
-      frames_published_.fetch_add(1);
 
-      ++window_frames_;
-      const auto now = std::chrono::steady_clock::now();
-      if (now - fps_window_ >= std::chrono::seconds(1)) {
-        measured_fps_.store(window_frames_);
-        window_frames_ = 0;
-        fps_window_ = now;
-      }
+      auto jpeg = std::make_shared<const std::vector<uint8_t>>(std::move(encoded.data));
+      // 保存原始帧用于下次去重比较，以及可复用的 JPEG。
+      last_bgra_ = buffer;
+      last_width_ = width;
+      last_height_ = height;
+      last_jpeg_ = jpeg;
+      last_encode_tp_ = now_tp;
+      encoded_once_ = true;
+      publish_and_count(std::move(jpeg));
     }
   }
 
@@ -486,12 +546,25 @@ class Gateway {
   int encoder_width_ = 0;
   int encoder_height_ = 0;
   CapturedFrame frame_;
+
+  // 编码线程独占：帧去重与无人降频。
+  std::vector<uint8_t> last_bgra_;
+  int last_width_ = 0;
+  int last_height_ = 0;
+  std::shared_ptr<const std::vector<uint8_t>> last_jpeg_;
+  std::chrono::steady_clock::time_point last_encode_tp_{};
+  bool encoded_once_ = false;
+
   std::chrono::steady_clock::time_point fps_window_{};
   int window_frames_ = 0;
 
   std::atomic<int> measured_fps_{0};
   std::atomic<uint64_t> frames_published_{0};
   std::atomic<int> viewers_{0};
+
+  std::atomic<uint64_t> last_activity_ms_{0};
+  std::mutex pause_mutex_;
+  std::condition_variable pause_cv_;
 };
 
 void serve_stream(Gateway& gateway, TcpSocket& socket) {
@@ -523,7 +596,8 @@ void serve_stream(Gateway& gateway, TcpSocket& socket) {
 }
 
 void bind_routes(HttpServer& server, Gateway& gateway) {
-  auto page_handler = [](const HttpRequest&, TcpSocket& socket) {
+  auto page_handler = [&gateway](const HttpRequest&, TcpSocket& socket) {
+    gateway.note_activity();
     return http_write_response(socket, 200, "text/html; charset=utf-8",
                                web_page_html());
   };
@@ -531,6 +605,7 @@ void bind_routes(HttpServer& server, Gateway& gateway) {
   server.route("/index.html", page_handler);
 
   server.route("/stream", [&gateway](const HttpRequest&, TcpSocket& socket) {
+    gateway.note_activity();
     gateway.add_viewer(1);
     serve_stream(gateway, socket);
     gateway.add_viewer(-1);
@@ -538,6 +613,7 @@ void bind_routes(HttpServer& server, Gateway& gateway) {
   });
 
   server.route("/snapshot", [&gateway](const HttpRequest&, TcpSocket& socket) {
+    gateway.note_activity();
     Snapshot snap;
     if (!gateway.frames().latest(snap) || !snap.jpeg || snap.jpeg->empty()) {
       return http_write_response(socket, 404, "text/plain; charset=utf-8",
@@ -552,11 +628,13 @@ void bind_routes(HttpServer& server, Gateway& gateway) {
   });
 
   server.route("/status", [&gateway](const HttpRequest&, TcpSocket& socket) {
+    gateway.note_activity();
     return http_write_response(socket, 200, "application/json",
                                gateway.status_json());
   });
 
   server.route("/input", [&gateway](const HttpRequest& request, TcpSocket& socket) {
+    gateway.note_activity();
     const bool ok = gateway.handle_input(request.body);
     return http_write_response(socket, 200, "application/json",
                                ok ? "{\"ok\":true}" : "{\"ok\":false}");
