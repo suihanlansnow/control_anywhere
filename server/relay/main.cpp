@@ -34,6 +34,8 @@ std::map<std::string, std::shared_ptr<Peer>> g_devices;
 std::map<uint64_t, Session> g_sessions;
 std::map<uint64_t, std::shared_ptr<Peer>> g_pending;  // session_id -> controller
 std::atomic<uint64_t> g_next_session{1000};
+// 启动参数指定，之后只读；随 RegisterAck 下发给被控端和主控端。
+std::vector<std::string> g_ice_servers;
 
 json::Value object() { return json::Value::make_object(); }
 
@@ -79,6 +81,13 @@ void handle_register(const std::shared_ptr<Peer>& peer, const DecodedFrame& fram
   json::Value ack = object();
   ack.set("ok", true);
   ack.set("device_id", device_id);
+  if (!g_ice_servers.empty()) {
+    json::Value ice = object();
+    json::Value servers = json::Value::make_array();
+    for (const auto& uri : g_ice_servers) servers.push(json::Value(uri));
+    ice.set("servers", servers);
+    ack.set("ice", ice);
+  }
   peer->conn->send_json(MsgType::RegisterAck, 0, ack);
   RC_LOGI("relay", "device registered: " << device_id << " (" << peer->alias << ")");
 }
@@ -293,9 +302,28 @@ void handle_client(std::shared_ptr<Connection> conn) {
 
 int main(int argc, char** argv) {
   uint16_t port = kDefaultControlPort;
-  for (int i = 1; i + 1 < argc; ++i) {
-    if (std::string(argv[i]) == "--port") {
-      port = static_cast<uint16_t>(std::atoi(argv[i + 1]));
+  auto with_scheme = [](const std::string& value, const std::string& scheme) {
+    if (value.rfind("stun:", 0) == 0 || value.rfind("turn:", 0) == 0 ||
+        value.rfind("turns:", 0) == 0) {
+      return value;
+    }
+    return scheme + value;
+  };
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    const bool has_next = (i + 1) < argc;
+    if (arg == "--port" && has_next) {
+      port = static_cast<uint16_t>(std::atoi(argv[++i]));
+    } else if (arg == "--stun" && has_next) {
+      g_ice_servers.push_back(with_scheme(argv[++i], "stun:"));
+    } else if (arg == "--turn" && has_next) {
+      g_ice_servers.push_back(with_scheme(argv[++i], "turn:"));
+    } else {
+      std::fprintf(stderr,
+                   "usage: %s [--port N] [--stun host:port] "
+                   "[--turn [user:pass@]host:port]\n",
+                   argv[0]);
+      return 2;
     }
   }
 

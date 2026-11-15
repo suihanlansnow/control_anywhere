@@ -54,6 +54,11 @@ enum class MsgType : uint8_t {
   FileEnd = 0x55,
   FileAbort = 0x56,
 
+  // WebRTC 信令：视频与输入改走 RTP/SCTP，这几类消息只经中继转发。
+  WebRtcOffer = 0x70,
+  WebRtcAnswer = 0x71,
+  WebRtcCandidate = 0x72,
+
   Error = 0x61,
 };
 

@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <functional>
+#include <string>
+#include <vector>
 
 // 同一套 UI 在两平台复用，仅采集后端与默认设备名按平台切换。
 #if defined(_WIN32)
@@ -341,6 +343,18 @@ class VideoWidget : public QWidget {
   QVBoxLayout* home_layout_ = nullptr;
   int home_index_ = 0;
 };
+
+// ICE 服务器输入：分号或逗号分隔，忽略空项。
+std::vector<std::string> split_ice_servers(const QString& text) {
+  std::vector<std::string> servers;
+  QString normalized = text;
+  normalized.replace(',', ';');
+  for (const QString& part : normalized.split(';', Qt::SkipEmptyParts)) {
+    const std::string uri = part.trimmed().toStdString();
+    if (!uri.empty()) servers.push_back(uri);
+  }
+  return servers;
+}
 
 }  // namespace
 
@@ -887,6 +901,42 @@ QWidget* MainWindow::buildNetworkPanel() {
     r2->addWidget(h2);
     vbox->addLayout(r2);
 
+#ifdef RC_ENABLE_WEBRTC
+    auto* line3 = new QFrame();
+    line3->setFrameShape(QFrame::HLine);
+    vbox->addWidget(line3);
+
+    switchWebRtc_ = new QCheckBox(tr("WebRTC 传输（实验）"));
+    switchWebRtc_->setObjectName("Switch");
+    switchWebRtc_->setChecked(false);
+    auto* h3 = new QLabel(tr("视频走 RTP、输入走 DataChannel，信令仍经中继转发"));
+    h3->setObjectName("FieldHint");
+    auto* r3 = new QVBoxLayout();
+    r3->setSpacing(2);
+    r3->addWidget(switchWebRtc_);
+    r3->addWidget(h3);
+    vbox->addLayout(r3);
+
+    editIceServers_ = new QLineEdit();
+    editIceServers_->setPlaceholderText(
+        tr("stun:stun.example.com:3478;turn:user:pass@turn.example.com:3478"));
+    auto* h4 = new QLabel(tr("ICE 服务器，留空则使用中继下发的配置，多个用分号分隔"));
+    h4->setObjectName("FieldHint");
+    vbox->addWidget(editIceServers_);
+    vbox->addWidget(h4);
+
+    switchIceRelayOnly_ = new QCheckBox(tr("仅使用 TURN 中继"));
+    switchIceRelayOnly_->setObjectName("Switch");
+    switchIceRelayOnly_->setChecked(false);
+    auto* h5 = new QLabel(tr("隐藏本机候选地址，强制经 TURN 转发（需配置可用 TURN）"));
+    h5->setObjectName("FieldHint");
+    auto* r4 = new QVBoxLayout();
+    r4->setSpacing(2);
+    r4->addWidget(switchIceRelayOnly_);
+    r4->addWidget(h5);
+    vbox->addLayout(r4);
+#endif
+
     // 自动重连可在会话进行中即时生效，无需重启会话。
     connect(switchAutoReconnect_, &QCheckBox::toggled, this, [this](bool on) {
       if (clientWorker_) clientWorker_->setAutoReconnect(on);
@@ -1159,6 +1209,12 @@ void MainWindow::onStartHost() {
   cfg.max_frames = 0;
   cfg.connect_timeout_ms = sliderTimeout_ ? sliderTimeout_->value() * 1000 : 5000;
   cfg.tcp_no_delay = switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true;
+  cfg.transport =
+      (switchWebRtc_ && switchWebRtc_->isChecked()) ? "webrtc" : "tcp";
+  cfg.ice_servers =
+      editIceServers_ ? split_ice_servers(editIceServers_->text())
+                      : std::vector<std::string>();
+  cfg.ice_force_relay = switchIceRelayOnly_ && switchIceRelayOnly_->isChecked();
 
   hostState_ = "connecting";
   if (hostStatusLabel_) hostStatusLabel_->setText(tr("正在开启被控端…"));
@@ -1206,6 +1262,12 @@ void MainWindow::onStartClient() {
   cfg.render = false;
   cfg.connect_timeout_ms = sliderTimeout_ ? sliderTimeout_->value() * 1000 : 5000;
   cfg.tcp_no_delay = switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true;
+  cfg.transport =
+      (switchWebRtc_ && switchWebRtc_->isChecked()) ? "webrtc" : "tcp";
+  cfg.ice_servers =
+      editIceServers_ ? split_ice_servers(editIceServers_->text())
+                      : std::vector<std::string>();
+  cfg.ice_force_relay = switchIceRelayOnly_ && switchIceRelayOnly_->isChecked();
 
   if (clientWorker_ && switchAutoReconnect_) {
     clientWorker_->setAutoReconnect(switchAutoReconnect_->isChecked());
@@ -1402,6 +1464,10 @@ void MainWindow::saveSettings() {
   s.setValue("network/timeout", sliderTimeout_ ? sliderTimeout_->value() : 30);
   s.setValue("network/auto_reconnect", switchAutoReconnect_ ? switchAutoReconnect_->isChecked() : true);
   s.setValue("network/tcp_no_delay", switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true);
+  s.setValue("network/webrtc", switchWebRtc_ ? switchWebRtc_->isChecked() : false);
+  s.setValue("network/ice_servers", editIceServers_ ? editIceServers_->text() : "");
+  s.setValue("network/ice_relay_only",
+             switchIceRelayOnly_ ? switchIceRelayOnly_->isChecked() : false);
   s.setValue("perm/keyboard", switchKeyboard_ ? switchKeyboard_->isChecked() : true);
   s.setValue("perm/mouse", switchMouse_ ? switchMouse_->isChecked() : true);
   s.setValue("perm/clipboard", switchClipboard_ ? switchClipboard_->isChecked() : false);
@@ -1424,6 +1490,11 @@ void MainWindow::loadSettings() {
   if (sliderTimeout_) sliderTimeout_->setValue(s.value("network/timeout", 30).toInt());
   if (switchAutoReconnect_) switchAutoReconnect_->setChecked(s.value("network/auto_reconnect", true).toBool());
   if (switchTcpNoDelay_) switchTcpNoDelay_->setChecked(s.value("network/tcp_no_delay", true).toBool());
+  if (switchWebRtc_) switchWebRtc_->setChecked(s.value("network/webrtc", false).toBool());
+  if (editIceServers_) editIceServers_->setText(s.value("network/ice_servers", "").toString());
+  if (switchIceRelayOnly_) {
+    switchIceRelayOnly_->setChecked(s.value("network/ice_relay_only", false).toBool());
+  }
   if (switchKeyboard_) switchKeyboard_->setChecked(s.value("perm/keyboard", true).toBool());
   if (switchMouse_) switchMouse_->setChecked(s.value("perm/mouse", true).toBool());
   if (switchClipboard_) switchClipboard_->setChecked(s.value("perm/clipboard", false).toBool());

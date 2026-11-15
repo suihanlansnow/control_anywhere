@@ -181,3 +181,58 @@ if(ENABLE_QT)
     set_target_properties(rc-app PROPERTIES WIN32_EXECUTABLE ON)
   endif()
 endif()
+
+# WebRTC 传输（可选）：libdatachannel 承载 RTP/SCTP，信令复用现有中继。
+# 依赖需先手动准备到 third_party（见 res/WEBRTC-POC.md）。
+option(RC_ENABLE_WEBRTC_POC "Build WebRTC transport POC (libdatachannel)" OFF)
+option(RC_ENABLE_WEBRTC "Enable WebRTC transport in rc_core (libdatachannel)" OFF)
+if(RC_ENABLE_WEBRTC_POC OR RC_ENABLE_WEBRTC)
+  set(RC_LDC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel-0.24.6")
+  set(RC_MBEDTLS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls-install")
+  if(NOT EXISTS "${RC_LDC_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "缺少 third_party/libdatachannel-0.24.6")
+  endif()
+  if(NOT EXISTS "${RC_MBEDTLS_ROOT}/lib/mbedcrypto.lib")
+    message(FATAL_ERROR "缺少 third_party/mbedtls-install（先构建并安装 Mbed TLS）")
+  endif()
+
+  # libdatachannel 的 FindMbedTLS.cmake 只认这几个缓存变量，先手工喂进去。
+  set(MbedTLS_INCLUDE_DIR "${RC_MBEDTLS_ROOT}/include" CACHE PATH "" FORCE)
+  set(MbedTLS_LIBRARY "${RC_MBEDTLS_ROOT}/lib/mbedtls.lib" CACHE FILEPATH "" FORCE)
+  set(MbedX509_LIBRARY "${RC_MBEDTLS_ROOT}/lib/mbedx509.lib" CACHE FILEPATH "" FORCE)
+  set(MbedCrypto_LIBRARY "${RC_MBEDTLS_ROOT}/lib/mbedcrypto.lib" CACHE FILEPATH "" FORCE)
+
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+  set(NO_TESTS ON CACHE BOOL "" FORCE)
+  set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+  set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
+  add_subdirectory(${RC_LDC_DIR} ${CMAKE_BINARY_DIR}/libdatachannel EXCLUDE_FROM_ALL)
+
+  # Mbed TLS 3.6 的 mbedcrypto 依赖 everest/p256m 两个静态库。
+  foreach(rc_lib datachannel-static datachannel)
+    if(TARGET ${rc_lib})
+      target_link_libraries(${rc_lib} PRIVATE
+        "${RC_MBEDTLS_ROOT}/lib/everest.lib" "${RC_MBEDTLS_ROOT}/lib/p256m.lib")
+    endif()
+  endforeach()
+endif()
+
+if(RC_ENABLE_WEBRTC)
+  target_sources(rc_core PRIVATE core/webrtc/webrtc_transport.cpp)
+  target_link_libraries(rc_core PUBLIC datachannel-static)
+  target_compile_definitions(rc_core PUBLIC RC_ENABLE_WEBRTC=1)
+  if(WIN32)
+    target_link_libraries(rc_core PUBLIC ws2_32 secur32 crypt32)
+  endif()
+endif()
+
+if(RC_ENABLE_WEBRTC_POC)
+  add_executable(rc-webrtc-poc apps/poc/webrtc_poc.cpp)
+  set_target_properties(rc-webrtc-poc PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(rc-webrtc-poc PRIVATE rc_core datachannel-static)
+  if(WIN32)
+    target_link_libraries(rc-webrtc-poc PRIVATE ws2_32 secur32 crypt32)
+  endif()
+endif()
+

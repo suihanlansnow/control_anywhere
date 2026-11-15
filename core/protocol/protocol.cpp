@@ -111,6 +111,9 @@ const char* msg_type_name(MsgType type) {
     case MsgType::FileChunk: return "FILE_CHUNK";
     case MsgType::FileEnd: return "FILE_END";
     case MsgType::FileAbort: return "FILE_ABORT";
+    case MsgType::WebRtcOffer: return "WEBRTC_OFFER";
+    case MsgType::WebRtcAnswer: return "WEBRTC_ANSWER";
+    case MsgType::WebRtcCandidate: return "WEBRTC_CANDIDATE";
     case MsgType::Error: return "ERROR";
   }
   return "UNKNOWN";

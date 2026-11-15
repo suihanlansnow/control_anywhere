@@ -1,6 +1,8 @@
 # Build
 build/
 build-win/
+build-webrtc/
+build-mbedtls/
 out/
 *.o
 *.obj
@@ -46,6 +48,9 @@ local.properties
 *.swp
 .dbg/
 .screenshots/
+
+# POC 第三方依赖（按需本地准备，不入库）
+third_party/
 
 # OS X
 .DS_Store

@@ -100,6 +100,11 @@ class MainWindow : public QMainWindow {
   QLabel* labelTimeoutVal_ = nullptr;
   QCheckBox* switchAutoReconnect_ = nullptr;
   QCheckBox* switchTcpNoDelay_ = nullptr;
+  // 实验特性：视频走 WebRTC（RTP/SCTP），信令仍复用中继。
+  QCheckBox* switchWebRtc_ = nullptr;
+  // WebRTC 的 ICE 配置：留空则使用中继下发的 STUN/TURN。
+  QLineEdit* editIceServers_ = nullptr;
+  QCheckBox* switchIceRelayOnly_ = nullptr;
 
   QCheckBox* switchKeyboard_ = nullptr;
   QCheckBox* switchMouse_ = nullptr;

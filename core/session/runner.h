@@ -51,12 +51,16 @@ class HostRunner {
 
  private:
   void log_(const std::string& level, const std::string& tag, const std::string& msg);
-  int stream_frames_(Connection& conn, uint64_t session_id);
+  int stream_frames_(Connection& conn, uint64_t session_id, bool use_webrtc);
 
   SessionConfig cfg_;
   std::atomic<bool> stop_flag_{false};
   std::atomic<bool> input_enabled_{true};
   std::atomic<int> requested_fps_{0};  // 主控在会话邀请里协商的 max_fps
+  // 主控在 ConnectReq.want.transport 里声明的传输方式；每次邀请重置。
+  std::string requested_transport_;
+  // 中继在 RegisterAck 下发的 ICE 服务器；本地 cfg_ 配置非空时优先使用本地。
+  std::vector<std::string> relay_ice_servers_;
   LogCallback log_cb_;
   StatusCallback status_cb_;
   ProgressCallback progress_cb_;
@@ -81,6 +85,8 @@ class ClientRunner {
 
   SessionConfig cfg_;
   std::atomic<bool> stop_flag_{false};
+  // 中继在 RegisterAck 下发的 ICE 服务器；本地 cfg_ 配置非空时优先使用本地。
+  std::vector<std::string> relay_ice_servers_;
   LogCallback log_cb_;
   StatusCallback status_cb_;
   ProgressCallback progress_cb_;

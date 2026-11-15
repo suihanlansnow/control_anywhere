@@ -16,6 +16,14 @@ struct SessionConfig {
   std::string password;
   std::string codec = "h264";
   std::string capture;
+  // 视频传输方式："tcp"（默认，走中继的 24 字节帧）或 "webrtc"（RTP/SCTP，
+  // 信令仍复用同一条中继连接）。主控端声明，被控端按需创建 PeerConnection。
+  std::string transport = "tcp";
+  // ICE 服务器（标准 URL：stun:host:port / turn:user:pass@host:port?transport=udp）。
+  // 留空时使用中继在 RegisterAck 下发的配置。
+  std::vector<std::string> ice_servers;
+  bool ice_force_relay = false;  // 只走 TURN
+  bool ice_tcp = false;          // 允许 ICE over TCP 候选
   int fps = 60;
   int quality = 75;
   int monitor = 0;

@@ -59,6 +59,12 @@ struct Options {
   std::string capture = "dxgi";
 #endif
   std::string codec = "h264";
+  // "tcp"（默认）或 "webrtc"；WebRTC 需要构建时开启 RC_ENABLE_WEBRTC。
+  std::string transport = "tcp";
+  // ICE 服务器；留空时使用中继在 RegisterAck 下发的配置。
+  std::vector<std::string> ice_servers;
+  bool ice_force_relay = false;
+  bool ice_tcp = false;
   uint16_t relay_port = kDefaultControlPort;
   int frames = 60;
   int fps = 60;
@@ -71,14 +77,20 @@ struct Options {
 void print_usage() {
   std::printf(
       "用法:\n"
-      "  rc-relay [--port 21116]\n"
+      "  rc-relay [--port 21116] [--stun host:port] "
+      "[--turn [user:pass@]host:port]\n"
       "  rc-cli host    --id <设备号> [--alias 名称] --password <密码> "
       "[--relay 127.0.0.1:21116]\n"
       "                 [--capture dxgi|synthetic] [--codec h264|jpeg] [--fps 60] "
       "[--quality 75] [--monitor 0] [--frames 60]\n"
+      "                 [--stun host:port] [--turn [user:pass@]host:port] "
+      "[--ice-relay] [--ice-tcp]\n"
       "  rc-cli connect <目标设备号> --password <密码> "
       "[--relay 127.0.0.1:21116] [--frames 30]\n"
-      "                 [--render|--no-render] [--dump-frame 首帧.jpg]\n"
+      "                 [--transport tcp|webrtc] [--render|--no-render] "
+      "[--dump-frame 首帧.jpg]\n"
+      "                 [--stun host:port] [--turn [user:pass@]host:port] "
+      "[--ice-relay] [--ice-tcp]\n"
       "  rc-cli selftest\n");
 }
 
@@ -127,6 +139,21 @@ bool parse_options(int argc, char** argv, Options& opts) {
       if (!take_value(opts.capture)) return false;
     } else if (arg == "--codec") {
       if (!take_value(opts.codec)) return false;
+    } else if (arg == "--transport") {
+      if (!take_value(opts.transport)) return false;
+    } else if (arg == "--stun" || arg == "--turn") {
+      std::string value;
+      if (!take_value(value)) return false;
+      const std::string scheme = arg == "--stun" ? "stun:" : "turn:";
+      if (value.rfind("stun:", 0) != 0 && value.rfind("turn:", 0) != 0 &&
+          value.rfind("turns:", 0) != 0) {
+        value = scheme + value;
+      }
+      opts.ice_servers.push_back(value);
+    } else if (arg == "--ice-relay") {
+      opts.ice_force_relay = true;
+    } else if (arg == "--ice-tcp") {
+      opts.ice_tcp = true;
     } else if (arg == "--monitor") {
       std::string value;
       if (!take_value(value)) return false;
@@ -596,6 +623,10 @@ rc::SessionConfig to_session_config(const Options& opts) {
   cfg.target_id = opts.target_id;
   cfg.password = opts.password;
   cfg.codec = opts.codec;
+  cfg.transport = opts.transport;
+  cfg.ice_servers = opts.ice_servers;
+  cfg.ice_force_relay = opts.ice_force_relay;
+  cfg.ice_tcp = opts.ice_tcp;
   cfg.capture = opts.capture;
   cfg.fps = opts.fps;
   cfg.quality = opts.quality;

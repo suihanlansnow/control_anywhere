@@ -25,6 +25,9 @@
 #include "input/windows_input_injector.h"
 #include "render/window_renderer.h"
 #endif
+#ifdef RC_ENABLE_WEBRTC
+#include "webrtc/webrtc_transport.h"
+#endif
 
 namespace rc {
 
@@ -65,6 +68,20 @@ static json::Value parse_payload_cfg(const DecodedFrame& frame) {
   } catch (const std::exception&) {
     return make_object();
   }
+}
+
+// 中继在 RegisterAck 里下发的 ICE 配置：{"ice":{"servers":["stun:...","turn:..."]}}。
+static std::vector<std::string> parse_ice_servers(const json::Value& ack) {
+  std::vector<std::string> servers;
+  const json::Value* ice = ack.get("ice");
+  if (!ice) return servers;
+  const json::Value* list = ice->get("servers");
+  if (!list || !list->is_array()) return servers;
+  for (std::size_t i = 0; i < list->size(); ++i) {
+    const std::string uri = list->at(i).as_string();
+    if (!uri.empty()) servers.push_back(uri);
+  }
+  return servers;
 }
 
 void write_input_u16(std::vector<uint8_t>& out, std::size_t offset, uint16_t value) {
@@ -127,6 +144,43 @@ std::vector<uint8_t> encode_input_event(const InputEvent& event) {
   return out;
 }
 
+#if defined(__linux__) || defined(_WIN32)
+// TCP 输入消息与 WebRTC DataChannel 共用同一套注入逻辑：
+// TCP 载荷从 0 开始，DataChannel 前置 1 字节 MsgType，因此用 offset 区分。
+void inject_remote_input(PlatformInputInjector& injector, MsgType type,
+                         const std::vector<uint8_t>& payload, std::size_t offset) {
+  switch (type) {
+    case MsgType::InputMouseMove:
+      if (payload.size() >= offset + 10) {
+        injector.mouse_move(read_input_u16(payload, offset + 4),
+                            read_input_u16(payload, offset + 6));
+      }
+      break;
+    case MsgType::InputMouseButton:
+      if (payload.size() >= offset + 12) {
+        injector.mouse_button(payload[offset + 4], payload[offset + 5] != 0,
+                              read_input_u16(payload, offset + 6),
+                              read_input_u16(payload, offset + 8));
+      }
+      break;
+    case MsgType::InputMouseWheel:
+      if (payload.size() >= offset + 8) {
+        injector.mouse_wheel(
+            static_cast<int16_t>(read_input_u16(payload, offset + 4)),
+            static_cast<int16_t>(read_input_u16(payload, offset + 6)));
+      }
+      break;
+    case MsgType::InputKey:
+      if (payload.size() >= offset + 12) {
+        injector.key(static_cast<int>(read_input_u32(payload, offset + 4)),
+                     payload[offset + 8]);
+      }
+      break;
+    default:
+      break;
+  }
+}
+#endif
 HostRunner::HostRunner(const SessionConfig& cfg) : cfg_(cfg) {}
 HostRunner::~HostRunner() { stop(); }
 
@@ -148,7 +202,8 @@ void HostRunner::log_(const std::string& level, const std::string& tag, const st
   }
 }
 
-int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
+int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
+                               bool use_webrtc) {
   std::string error;
   std::unique_ptr<ICaptureSource> capture = create_capture_source(cfg_.capture, &error);
   if (!capture) {
@@ -253,6 +308,86 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   }
 #endif
 
+#ifdef RC_ENABLE_WEBRTC
+  // WebRTC：视频走 RTP，输入走 DataChannel；信令复用当前中继连接。
+  std::unique_ptr<WebRtcHost> rtc;
+  std::mutex rtc_input_mutex;
+  std::condition_variable rtc_input_cv;
+  std::deque<std::vector<uint8_t>> rtc_input_queue;
+  std::atomic<bool> rtc_input_stop{false};
+  std::atomic<int> rtc_deferred_frames{0};
+  std::thread rtc_input_thread;
+  if (use_webrtc) {
+    rtc = std::make_unique<WebRtcHost>();
+    WebRtcHost::Callbacks rtc_cb;
+    rtc_cb.signaling.on_local_description = [&conn, session_id](
+                                                const std::string& type,
+                                                const std::string& sdp) {
+      json::Value payload = make_object();
+      payload.set("type", type);
+      payload.set("sdp", sdp);
+      conn.send_json(MsgType::WebRtcOffer, session_id, payload);
+    };
+    rtc_cb.signaling.on_local_candidate = [&conn, session_id](
+                                              const std::string& candidate,
+                                              const std::string& mid) {
+      json::Value payload = make_object();
+      payload.set("candidate", candidate);
+      payload.set("mid", mid);
+      conn.send_json(MsgType::WebRtcCandidate, session_id, payload);
+    };
+    rtc_cb.on_input = [&](const uint8_t* data, std::size_t size) {
+      if (size < 2) return;
+      {
+        std::lock_guard<std::mutex> lock(rtc_input_mutex);
+        // 输入只保留最新状态，积压时丢最旧的，避免执行一串过期事件。
+        if (rtc_input_queue.size() >= 256) rtc_input_queue.pop_front();
+        rtc_input_queue.emplace_back(data, data + size);
+      }
+      rtc_input_cv.notify_one();
+    };
+    std::string rtc_error;
+    WebRtcConfig rtc_config;
+    // 本地显式配置优先，否则使用中继在 RegisterAck 下发的 STUN/TURN。
+    rtc_config.ice_servers =
+        cfg_.ice_servers.empty() ? relay_ice_servers_ : cfg_.ice_servers;
+    rtc_config.force_relay = cfg_.ice_force_relay;
+    rtc_config.enable_ice_tcp = cfg_.ice_tcp;
+    if (!rtc_config.ice_servers.empty()) {
+      log_("INFO", "webrtc", "ice servers=" +
+                               std::to_string(rtc_config.ice_servers.size()));
+    }
+    if (!rtc->start(rtc_cb, rtc_config, &rtc_error)) {
+      log_("WARN", "webrtc", "start failed: " + rtc_error + ", fallback to tcp");
+      rtc.reset();
+    } else {
+      log_("INFO", "webrtc", "transport ready, offer sent via relay");
+    }
+  }
+#if defined(__linux__) || defined(_WIN32)
+  if (rtc) {
+    rtc_input_thread = std::thread([&] {
+      while (!rtc_input_stop.load()) {
+        std::vector<uint8_t> event;
+        {
+          std::unique_lock<std::mutex> lock(rtc_input_mutex);
+          rtc_input_cv.wait(lock, [&] {
+            return rtc_input_stop.load() || !rtc_input_queue.empty();
+          });
+          if (rtc_input_stop.load() && rtc_input_queue.empty()) break;
+          event = std::move(rtc_input_queue.front());
+          rtc_input_queue.pop_front();
+        }
+        if (!input_enabled_.load() || event.empty()) continue;
+        inject_remote_input(input_injector, static_cast<MsgType>(event[0]), event, 1);
+      }
+    });
+  }
+#endif
+#else
+  (void)use_webrtc;
+#endif
+
   // 推流期间也要接收控制消息，否则主控断开后中继发来的 SessionClose
   // 会一直堆在接收缓冲区，Host 无法结束旧会话或接受下一次连接。
   conn.set_recv_timeout_ms(200);
@@ -273,41 +408,38 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
         break;
       }
       if (incoming.session_id != session_id) continue;
+#ifdef RC_ENABLE_WEBRTC
+      // WebRTC 信令：answer 与 ICE 候选都通过同一条中继连接回传。
+      if (rtc) {
+        if (incoming.type == MsgType::WebRtcAnswer) {
+          json::Value payload = parse_payload_cfg(incoming);
+          const json::Value* sdp = payload.get("sdp");
+          std::string rtc_error;
+          if (!sdp || !rtc->set_answer(sdp->as_string(), &rtc_error)) {
+            log_("WARN", "webrtc", "apply answer failed: " + rtc_error);
+          } else {
+            log_("INFO", "webrtc", "answer applied");
+          }
+          continue;
+        }
+        if (incoming.type == MsgType::WebRtcCandidate) {
+          json::Value payload = parse_payload_cfg(incoming);
+          const json::Value* candidate = payload.get("candidate");
+          const json::Value* mid = payload.get("mid");
+          if (candidate) {
+            rtc->add_remote_candidate(candidate->as_string(),
+                                      mid ? mid->as_string() : "video");
+          }
+          continue;
+        }
+      }
+#endif
 #if defined(__linux__) || defined(_WIN32)
       if (!input_enabled_.load()) {
         // 仅观看模式：消息照常消费，但不下发到注入器。
         continue;
       }
-      switch (incoming.type) {
-        case MsgType::InputMouseMove:
-          if (incoming.payload.size() >= 10) {
-            input_injector.mouse_move(read_input_u16(incoming.payload, 4),
-                                      read_input_u16(incoming.payload, 6));
-          }
-          break;
-        case MsgType::InputMouseButton:
-          if (incoming.payload.size() >= 12) {
-            input_injector.mouse_button(incoming.payload[4], incoming.payload[5] != 0,
-                                        read_input_u16(incoming.payload, 6),
-                                        read_input_u16(incoming.payload, 8));
-          }
-          break;
-        case MsgType::InputMouseWheel:
-          if (incoming.payload.size() >= 8) {
-            input_injector.mouse_wheel(
-                static_cast<int16_t>(read_input_u16(incoming.payload, 4)),
-                static_cast<int16_t>(read_input_u16(incoming.payload, 6)));
-          }
-          break;
-        case MsgType::InputKey:
-          if (incoming.payload.size() >= 12) {
-            input_injector.key(static_cast<int>(read_input_u32(incoming.payload, 4)),
-                               incoming.payload[8]);
-          }
-          break;
-        default:
-          break;
-      }
+      inject_remote_input(input_injector, incoming.type, incoming.payload, 0);
 #endif
     }
   });
@@ -337,6 +469,7 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   });
 
   std::thread send_thread([&]() {
+    auto last_heartbeat = std::chrono::steady_clock::now();
     while (true) {
       SendTask task;
       bool has_task = false;
@@ -363,8 +496,37 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
         continue;
       }
       // B2: 使用 send_video_frame（复用缓冲 + 一次发送），取代 build_video_payload + conn.send。
-      if (!conn.send_video_frame(task.session_id, task.meta, task.data.data(),
-                                 task.data.size(), task.frame_id)) {
+      bool frame_sent = false;
+#ifdef RC_ENABLE_WEBRTC
+      if (rtc) {
+        // 未连接时 send_video 返回 false：丢弃本帧等链路就绪，不终止会话。
+        frame_sent = rtc->send_video(task.data.data(), task.data.size());
+        if (!frame_sent) {
+          const int deferred = rtc_deferred_frames.fetch_add(1) + 1;
+          if (deferred == 1 || deferred % 100 == 0) {
+            log_("INFO", "webrtc", "video not connected yet, dropped " +
+                                     std::to_string(deferred) + " frames");
+          }
+          continue;
+        }
+        // WebRTC 模式下控制连接没有视频帧，需独立保活，否则主控端会读超时。
+        const auto now_tp = std::chrono::steady_clock::now();
+        if (now_tp - last_heartbeat >= std::chrono::seconds(1)) {
+          last_heartbeat = now_tp;
+          if (!conn.send(MsgType::Heartbeat, session_id, nullptr, 0)) {
+            log_("WARN", "host", "send heartbeat failed");
+            send_failed.store(true);
+            break;
+          }
+        }
+      } else
+#endif
+      {
+        frame_sent = conn.send_video_frame(task.session_id, task.meta,
+                                           task.data.data(), task.data.size(),
+                                           task.frame_id);
+      }
+      if (!frame_sent) {
         log_("WARN", "host", "send frame failed");
         send_failed.store(true);
         break;
@@ -464,6 +626,19 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
   control_thread.join();
   conn.set_recv_timeout_ms(30000);
 
+#ifdef RC_ENABLE_WEBRTC
+  rtc_input_stop.store(true);
+  rtc_input_cv.notify_all();
+  if (rtc_input_thread.joinable()) rtc_input_thread.join();
+  if (rtc) {
+    if (rtc_deferred_frames.load() > 0) {
+      log_("INFO", "webrtc", "frames dropped before connect=" +
+                                  std::to_string(rtc_deferred_frames.load()));
+    }
+    rtc->close();
+  }
+#endif
+
   encoder->close();
   log_("INFO", "host", "frames_encoded=" + std::to_string(encoded_count) +
                          " frames_sent=" + std::to_string(sent_count.load()) +
@@ -510,6 +685,7 @@ int HostRunner::run() {
           log_("ERROR", "host", "register rejected");
           return 2;
         }
+        relay_ice_servers_ = parse_ice_servers(payload);
         guard.move_to(SessionState::Registered);
         log_("INFO", "host", "online, waiting for controller");
         if (status_cb_) status_cb_("registered");
@@ -526,9 +702,14 @@ int HostRunner::run() {
         }
         // 主控在 ConnectReq.want 里声明可接受的最高帧率，这里记录后按需降帧编码。
         requested_fps_.store(0);  // 本次邀请未声明时不能沿用上一会话的值
+        requested_transport_.clear();
         if (const json::Value* want_field = payload.get("want")) {
           if (const json::Value* fps_field = want_field->get("max_fps")) {
             requested_fps_.store(static_cast<int>(fps_field->as_int(0)));
+          }
+          // 主控声明期望的传输方式（"tcp" / "webrtc"），由被控端决定最终值。
+          if (const json::Value* transport_field = want_field->get("transport")) {
+            requested_transport_ = transport_field->as_string("tcp");
           }
         }
         guard.move_to(SessionState::Invited);
@@ -555,7 +736,21 @@ int HostRunner::run() {
 
         json::Value result = make_object();
         result.set("ok", ok);
-        if (!ok) result.set("reason", "bad password");
+        // 告知主控端最终使用的传输方式：请求了 WebRTC 但本端不支持时回落 TCP。
+        std::string transport = "tcp";
+#ifdef RC_ENABLE_WEBRTC
+        if (requested_transport_ == "webrtc") transport = "webrtc";
+#else
+        if (requested_transport_ == "webrtc") {
+          log_("WARN", "webrtc",
+               "controller requested webrtc but this build has no WebRTC support, using tcp");
+        }
+#endif
+        if (!ok) {
+          result.set("reason", "bad password");
+        } else {
+          result.set("transport", transport);
+        }
         conn.send_json(MsgType::AuthResult, session_id, result);
 
         if (!ok) {
@@ -563,16 +758,19 @@ int HostRunner::run() {
           guard.move_to(SessionState::Registered);
           session_id = 0;
           nonce.clear();
+          requested_transport_.clear();
           if (status_cb_) status_cb_("registered");
           break;
         }
         guard.move_to(SessionState::Ready);
         guard.move_to(SessionState::Streaming);
-        log_("INFO", "host", "authentication passed, starting capture/encode");
-        stream_frames_(conn, session_id);
+        log_("INFO", "host", "authentication passed, starting capture/encode (transport=" +
+                              transport + ")");
+        stream_frames_(conn, session_id, transport == "webrtc");
         guard = SessionGuard(SessionState::Registered);
         session_id = 0;
         nonce.clear();
+        requested_transport_.clear();
         log_("INFO", "host", "session ended, waiting for next controller");
         if (status_cb_) status_cb_("registered");
         break;
@@ -667,6 +865,7 @@ int ClientRunner::run() {
         log_("ERROR", "ctrl", "register rejected");
         return 2;
       }
+      relay_ice_servers_ = parse_ice_servers(payload);
       break;
     }
   }
@@ -684,6 +883,7 @@ int ClientRunner::run() {
   json::Value want = make_object();
   want.set("codec", cfg_.codec);
   want.set("max_fps", cfg_.fps);
+  want.set("transport", cfg_.transport);
   request.set("want", want);
   conn.send_json(MsgType::ConnectReq, 0, request);
   guard.move_to(SessionState::Connecting);
@@ -724,6 +924,8 @@ int ClientRunner::run() {
   std::vector<uint8_t> decode_payload;
   VideoFrameMeta decode_meta;
   bool decode_has_frame = false;
+  // WebRTC 帧已经解包成完整 Annex-B，不再带 32 字节视频头。
+  bool decode_webrtc = false;
   std::atomic<bool> decode_stop{false};
   std::atomic<int> frames_decoded{0};
   std::atomic<uint64_t> total_decode_us{0};
@@ -734,19 +936,24 @@ int ClientRunner::run() {
     while (true) {
       std::vector<uint8_t> payload;
       VideoFrameMeta meta;
+      bool webrtc_frame = false;
       {
         std::unique_lock<std::mutex> lock(decode_mutex);
         decode_cv.wait(lock, [&] { return decode_has_frame || decode_stop.load(); });
         if (decode_stop.load() && !decode_has_frame) break;
         payload = std::move(decode_payload);
         meta = decode_meta;
+        webrtc_frame = decode_webrtc;
+        decode_webrtc = false;
         decode_has_frame = false;
       }
 
-      const std::size_t data_len = payload.size() >= kVideoHeaderBytes
-          ? payload.size() - kVideoHeaderBytes : 0;
+      const std::size_t data_len = webrtc_frame
+          ? payload.size()
+          : (payload.size() >= kVideoHeaderBytes ? payload.size() - kVideoHeaderBytes : 0);
       if (data_len == 0) continue;
-      const uint8_t* data = payload.data() + kVideoHeaderBytes;
+      const uint8_t* data =
+          webrtc_frame ? payload.data() : payload.data() + kVideoHeaderBytes;
 
       if (!decoder) {
         std::string dec_error;
@@ -830,6 +1037,12 @@ int ClientRunner::run() {
     }
   } hb_joiner{&hb_stop, &hb_thread};
 
+#ifdef RC_ENABLE_WEBRTC
+  // 声明在解码线程之后：析构先于解码状态，避免回调访问已释放的队列。
+  std::unique_ptr<WebRtcClient> rtc_client;
+  std::atomic<WebRtcClient*> rtc_active{nullptr};
+#endif
+
   std::thread input_thread([&]() {
     while (true) {
       InputEvent event;
@@ -843,8 +1056,19 @@ int ClientRunner::run() {
       const uint64_t sid = input_session_.load();
       if (sid == 0) continue;
       const std::vector<uint8_t> payload = encode_input_event(event);
-      if (!payload.empty() &&
-          !conn.send(event.type, sid, payload.data(), payload.size())) {
+      if (payload.empty()) continue;
+#ifdef RC_ENABLE_WEBRTC
+      if (WebRtcClient* rtc = rtc_active.load()) {
+        // DataChannel 消息前置 1 字节 MsgType，被控端据此复用同一套注入逻辑。
+        std::vector<uint8_t> message;
+        message.reserve(payload.size() + 1);
+        message.push_back(static_cast<uint8_t>(event.type));
+        message.insert(message.end(), payload.begin(), payload.end());
+        rtc->send_input(message.data(), message.size());
+        continue;
+      }
+#endif
+      if (!conn.send(event.type, sid, payload.data(), payload.size())) {
         stop_flag_.store(true);
         break;
       }
@@ -939,10 +1163,102 @@ int ClientRunner::run() {
           if (status_cb_) status_cb_("auth_failed");
           return 3;
         }
+#ifdef RC_ENABLE_WEBRTC
+        // 被控端在 AuthResult 中告知最终传输方式；请求 WebRTC 且两端都支持时才切换。
+        const std::string transport =
+            payload.get("transport") ? payload.get("transport")->as_string("tcp") : "tcp";
+        if (transport == "webrtc") {
+          rtc_client = std::make_unique<WebRtcClient>();
+          WebRtcClient::Callbacks rtc_cb;
+          rtc_cb.signaling.on_local_description =
+              [&conn, session_id](const std::string& type, const std::string& sdp) {
+                json::Value body = make_object();
+                body.set("type", type);
+                body.set("sdp", sdp);
+                conn.send_json(MsgType::WebRtcAnswer, session_id, body);
+              };
+          rtc_cb.signaling.on_local_candidate =
+              [&conn, session_id](const std::string& candidate, const std::string& mid) {
+                json::Value body = make_object();
+                body.set("candidate", candidate);
+                body.set("mid", mid);
+                conn.send_json(MsgType::WebRtcCandidate, session_id, body);
+              };
+          rtc_cb.on_video = [&](const uint8_t* data, std::size_t size,
+                                uint32_t /*rtp_timestamp*/) {
+            // 网络线程：只入队，解码交给独立线程。
+            {
+              std::lock_guard<std::mutex> lock(decode_mutex);
+              decode_payload.assign(data, data + size);
+              decode_meta = VideoFrameMeta{};
+              decode_webrtc = true;
+              decode_has_frame = true;
+            }
+            decode_cv.notify_one();
+            ++frames_received;
+            bytes_received += size;
+            if (progress_cb_) {
+              progress_cb_(frames_received, static_cast<int64_t>(bytes_received));
+            }
+            // VideoFrame 走 TCP 时的帧数上限判断在 recv 循环里，这里补上 WebRTC 路径。
+            if (cfg_.max_frames > 0 && frames_received >= cfg_.max_frames) {
+              stop_flag_.store(true);
+            }
+          };
+          std::string rtc_error;
+          WebRtcConfig rtc_config;
+          rtc_config.ice_servers =
+              cfg_.ice_servers.empty() ? relay_ice_servers_ : cfg_.ice_servers;
+          rtc_config.force_relay = cfg_.ice_force_relay;
+          rtc_config.enable_ice_tcp = cfg_.ice_tcp;
+          if (!rtc_config.ice_servers.empty()) {
+            log_("INFO", "webrtc", "ice servers=" +
+                                     std::to_string(rtc_config.ice_servers.size()));
+          }
+          if (!rtc_client->start(rtc_cb, rtc_config, &rtc_error)) {
+            log_("ERROR", "webrtc", "client start failed: " + rtc_error);
+            rtc_client.reset();
+          } else {
+            rtc_active.store(rtc_client.get());
+            log_("INFO", "webrtc", "transport enabled, waiting for offer");
+          }
+        } else if (cfg_.transport == "webrtc") {
+          log_("WARN", "webrtc", "host does not support webrtc, falling back to tcp");
+        }
+#endif
         guard.move_to(SessionState::Ready);
         guard.move_to(SessionState::Streaming);
         log_("INFO", "ctrl", "authenticated");
         if (status_cb_) status_cb_("streaming");
+        break;
+      }
+      case MsgType::WebRtcOffer: {
+#ifdef RC_ENABLE_WEBRTC
+        if (rtc_client) {
+          json::Value payload = parse_payload_cfg(frame);
+          const json::Value* sdp = payload.get("sdp");
+          std::string rtc_error;
+          if (!sdp || !rtc_client->set_offer(sdp->as_string(), &rtc_error)) {
+            log_("ERROR", "webrtc", "apply offer failed: " + rtc_error);
+          } else {
+            log_("INFO", "webrtc", "offer applied, answer sent");
+          }
+        }
+#endif
+        break;
+      }
+      case MsgType::WebRtcCandidate: {
+#ifdef RC_ENABLE_WEBRTC
+        if (rtc_client) {
+          json::Value payload = parse_payload_cfg(frame);
+          const json::Value* candidate = payload.get("candidate");
+          const json::Value* mid = payload.get("mid");
+          if (candidate) {
+            rtc_client->add_remote_candidate(candidate->as_string(),
+                                             mid ? mid->as_string() : "video");
+          }
+        }
+#endif
         break;
       }
       case MsgType::VideoFrame: {
