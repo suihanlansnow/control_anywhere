@@ -46,7 +46,8 @@ class TcpSocket {
   // 发送超时：对端长期不读时，send 不能无限阻塞（会连带卡住持锁的调用方）。
   void set_send_timeout_ms(int milliseconds);
 
-  static TcpSocket connect(const std::string& host, uint16_t port, std::string* error);
+  static TcpSocket connect(const std::string& host, uint16_t port, std::string* error,
+                           int timeout_ms = 5000, bool no_delay = true);
 
  private:
   intptr_t fd_ = -1;

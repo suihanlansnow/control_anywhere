@@ -27,6 +27,7 @@ static constexpr const char* kPlatformName = "Linux";
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDesktopServices>
 #include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -49,6 +50,7 @@ static constexpr const char* kPlatformName = "Linux";
 #include <QSysInfo>
 #include <QTextEdit>
 #include <QToolTip>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
@@ -775,32 +777,15 @@ QWidget* MainWindow::buildDisplayPanel() {
   }
   scroll->addWidget(cardVideo, 1);
 
-  auto* card2 = makeCard(tr("编码与渲染"));
+  auto* card2 = makeCard(tr("编码"));
   {
     auto* vbox = static_cast<QVBoxLayout*>(card2->layout());
-    auto* comboRow = new QHBoxLayout();
-    comboRow->setSpacing(14);
-    auto* col1 = new QVBoxLayout();
+    // 编码固定为 H.264：服务端只提供 H.264 编码器，客户端也只内置 H.264 解码器。
     auto* lblCodec = new QLabel(tr("视频编码"));
     lblCodec->setObjectName("FieldLabel");
-    comboCodec_ = new QComboBox();
-    comboCodec_->addItem(tr("H.264（硬件加速）"), "h264");
-    comboCodec_->addItem(tr("H.264（软件编码）"), "h264-soft");
-    comboCodec_->addItem(tr("JPEG"), "jpeg");
-    col1->addWidget(lblCodec);
-    col1->addWidget(comboCodec_);
-
-    auto* col2 = new QVBoxLayout();
-    auto* lblRender = new QLabel(tr("渲染模式"));
-    lblRender->setObjectName("FieldLabel");
-    auto* comboRender = new QComboBox();
-    comboRender->addItem(tr("GPU 直出（零拷贝）"));
-    comboRender->addItem(tr("CPU 回读"));
-    col2->addWidget(lblRender);
-    col2->addWidget(comboRender);
-    comboRow->addLayout(col1, 1);
-    comboRow->addLayout(col2, 1);
-    vbox->addLayout(comboRow);
+    auto* codecValue = new QLabel(tr("H.264（硬件加速，自动回退软件编码）"));
+    vbox->addWidget(lblCodec);
+    vbox->addWidget(codecValue);
 
     vbox->addSpacing(8);
     switchAutoBitrate_ = new QCheckBox(tr("自适应码率"));
@@ -820,10 +805,7 @@ QWidget* MainWindow::buildDisplayPanel() {
   btnRow->setSpacing(10);
   auto* saveBtn = new QPushButton(tr("保存"));
   saveBtn->setObjectName("BtnPrimary");
-  auto* resetBtn = new QPushButton(tr("重置"));
-  resetBtn->setObjectName("BtnGhost");
   btnRow->addWidget(saveBtn);
-  btnRow->addWidget(resetBtn);
   btnRow->addStretch();
   scroll->addLayout(btnRow);
   scroll->addStretch();
@@ -904,6 +886,11 @@ QWidget* MainWindow::buildNetworkPanel() {
     r2->addWidget(switchTcpNoDelay_);
     r2->addWidget(h2);
     vbox->addLayout(r2);
+
+    // 自动重连可在会话进行中即时生效，无需重启会话。
+    connect(switchAutoReconnect_, &QCheckBox::toggled, this, [this](bool on) {
+      if (clientWorker_) clientWorker_->setAutoReconnect(on);
+    });
   }
   scroll->addWidget(card2);
 
@@ -1012,6 +999,19 @@ QWidget* MainWindow::buildPermissionPanel() {
   scroll->addLayout(btnRow);
   scroll->addStretch();
 
+  connect(resetBtn, &QPushButton::clicked, this, [this] {
+    // 恢复默认权限：键鼠、剪贴板、多显示器开启，文件与音频关闭。
+    const struct { QCheckBox* box; bool value; } defaults[] = {
+        {switchKeyboard_, true},  {switchMouse_, true},
+        {switchClipboard_, true}, {switchFileTransfer_, false},
+        {switchAudio_, false},    {switchMultiMonitor_, true},
+    };
+    for (const auto& item : defaults) {
+      if (item.box) item.box->setChecked(item.value);
+    }
+    saveSettings();
+    if (logView_) logView_->append(tr("权限已恢复默认"));
+  });
   connect(saveBtn, &QPushButton::clicked, this, &MainWindow::onSaveSettings);
   return panel;
 }
@@ -1076,7 +1076,7 @@ QWidget* MainWindow::buildAboutPanel() {
     };
     vbox->addWidget(makeInfoRow(tr("版本"), mkVal("0.1.0")));
     vbox->addWidget(makeInfoRow(tr("协议"), mkVal("rc-frame v1")));
-    vbox->addWidget(makeInfoRow(tr("编码器"), mkVal("H.264 / JPEG")));
+    vbox->addWidget(makeInfoRow(tr("编码器"), mkVal("H.264")));
     vbox->addWidget(makeInfoRow(tr("平台"), mkVal(kPlatformName)));
     vbox->addWidget(makeInfoRow(tr("构建类型"), mkVal("Release")));
   }
@@ -1093,14 +1093,10 @@ QWidget* MainWindow::buildAboutPanel() {
     };
 
     badgeConn_ = mkBadge(tr("● 未连接"), "BadgeOff");
-    badgeCapture_ = mkBadge(tr("—"), "BadgeOff");
     badgeCodec_ = mkBadge(tr("—"), "BadgeOff");
-    badgeLoss_ = mkBadge(tr("—"), "BadgeOff");
 
     vbox->addWidget(makeInfoRow(tr("连接状态"), badgeConn_));
-    vbox->addWidget(makeInfoRow(tr("采集"), badgeCapture_));
-    vbox->addWidget(makeInfoRow(tr("编码"), badgeCodec_));
-    vbox->addWidget(makeInfoRow(tr("丢帧率"), badgeLoss_));
+    vbox->addWidget(makeInfoRow(tr("帧率 / 带宽"), badgeCodec_));
   }
   scroll->addWidget(card2);
 
@@ -1116,6 +1112,10 @@ QWidget* MainWindow::buildAboutPanel() {
   scroll->addLayout(btnRow);
   scroll->addStretch();
 
+  connect(checkBtn, &QPushButton::clicked, this, [] {
+    QDesktopServices::openUrl(
+        QUrl(QStringLiteral("https://github.com/suihanlansnow/control_anywhere/releases")));
+  });
   connect(disconnectBtn, &QPushButton::clicked, this, &MainWindow::onStopClient);
   return panel;
 }
@@ -1153,10 +1153,12 @@ void MainWindow::onStartHost() {
                       : kPlatformFallbackHostId;
   cfg.alias = kPlatformName;
   cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
-  cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
+  cfg.codec = "h264";
   cfg.capture = kPlatformCapture;
   cfg.fps = 30;
   cfg.max_frames = 0;
+  cfg.connect_timeout_ms = sliderTimeout_ ? sliderTimeout_->value() * 1000 : 5000;
+  cfg.tcp_no_delay = switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true;
 
   hostState_ = "connecting";
   if (hostStatusLabel_) hostStatusLabel_->setText(tr("正在开启被控端…"));
@@ -1200,10 +1202,19 @@ void MainWindow::onStartClient() {
   cfg.device_id = kPlatformClientId;
   cfg.target_id = target.toStdString();
   cfg.password = password.toStdString();
-  cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "h264";
+  cfg.codec = "h264";
   cfg.render = false;
+  cfg.connect_timeout_ms = sliderTimeout_ ? sliderTimeout_->value() * 1000 : 5000;
+  cfg.tcp_no_delay = switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true;
+
+  if (clientWorker_ && switchAutoReconnect_) {
+    clientWorker_->setAutoReconnect(switchAutoReconnect_->isChecked());
+  }
 
   clientState_ = "connecting";
+  // 新会话的帧计数从头开始，避免与上一会话的累计值相减。
+  lastProgressFrames_ = -1;
+  lastProgressBytes_ = 0;
   if (clientStatusLabel_) clientStatusLabel_->setText(tr("正在连接 %1 …").arg(target));
   updateStatusLabel();
 
@@ -1332,16 +1343,31 @@ void MainWindow::onClientStatus(const QString& state) {
 }
 
 void MainWindow::onProgressUpdated(int frames, qlonglong bytes) {
-  Q_UNUSED(frames);
-  if (badgeCapture_) {
-    QString codecText = comboCodec_ ? comboCodec_->currentText() : "H.264";
-    badgeCodec_->setText(codecText);
-    badgeCodec_->setObjectName("BadgeOk");
-    badgeCodec_->style()->unpolish(badgeCodec_);
-    badgeCodec_->style()->polish(badgeCodec_);
-  }
-  if (logView_) {
-    logView_->append(QString("progress: frames=%1 bytes=%2").arg(frames).arg(bytes));
+  // progress 回调是累计值，按两次回调的差值换算实时帧率与带宽。
+  const auto now = std::chrono::steady_clock::now();
+  if (lastProgressFrames_ >= 0 && frames > lastProgressFrames_) {
+    const double seconds =
+        std::chrono::duration<double>(now - lastProgressTime_).count();
+    if (seconds >= 0.5) {
+      const double fps = (frames - lastProgressFrames_) / seconds;
+      const double mbps = static_cast<double>(bytes - lastProgressBytes_) * 8.0 /
+                          seconds / 1000000.0;
+      if (badgeCodec_) {
+        badgeCodec_->setText(QString("%1 fps · %2 Mbps")
+                                 .arg(fps, 0, 'f', 1)
+                                 .arg(mbps, 0, 'f', 2));
+        badgeCodec_->setObjectName("BadgeOk");
+        badgeCodec_->style()->unpolish(badgeCodec_);
+        badgeCodec_->style()->polish(badgeCodec_);
+      }
+      lastProgressFrames_ = frames;
+      lastProgressBytes_ = bytes;
+      lastProgressTime_ = now;
+    }
+  } else {
+    lastProgressFrames_ = frames;
+    lastProgressBytes_ = bytes;
+    lastProgressTime_ = now;
   }
 }
 
@@ -1372,7 +1398,6 @@ void MainWindow::saveSettings() {
   s.setValue("security/password", editPassword_ ? editPassword_->text() : "");
   s.setValue("client/target", editTargetId_ ? editTargetId_->text() : "");
   s.setValue("client/password", editConnectPassword_ ? editConnectPassword_->text() : "");
-  if (comboCodec_) s.setValue("display/codec", comboCodec_->currentData().toString());
   s.setValue("display/auto_bitrate", switchAutoBitrate_ ? switchAutoBitrate_->isChecked() : false);
   s.setValue("network/timeout", sliderTimeout_ ? sliderTimeout_->value() : 30);
   s.setValue("network/auto_reconnect", switchAutoReconnect_ ? switchAutoReconnect_->isChecked() : true);
@@ -1394,11 +1419,6 @@ void MainWindow::loadSettings() {
   if (editTargetId_) editTargetId_->setText(s.value("client/target", "").toString());
   if (editConnectPassword_) {
     editConnectPassword_->setText(s.value("client/password", "").toString());
-  }
-  if (comboCodec_) {
-    const QString codec = s.value("display/codec", "h264").toString();
-    const int idx = comboCodec_->findData(codec);
-    if (idx >= 0) comboCodec_->setCurrentIndex(idx);
   }
   if (switchAutoBitrate_) switchAutoBitrate_->setChecked(s.value("display/auto_bitrate", false).toBool());
   if (sliderTimeout_) sliderTimeout_->setValue(s.value("network/timeout", 30).toInt());

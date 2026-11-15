@@ -4,6 +4,8 @@
 #include <QMainWindow>
 #include <QThread>
 
+#include <chrono>
+
 #include "backend_worker.h"
 
 class QLabel;
@@ -92,7 +94,6 @@ class MainWindow : public QMainWindow {
   QPushButton* btnConnect_ = nullptr;
   QPushButton* btnDisconnect_ = nullptr;
 
-  QComboBox* comboCodec_ = nullptr;
   QCheckBox* switchAutoBitrate_ = nullptr;
 
   QSlider* sliderTimeout_ = nullptr;
@@ -108,9 +109,11 @@ class MainWindow : public QMainWindow {
   QCheckBox* switchMultiMonitor_ = nullptr;
 
   QLabel* badgeConn_ = nullptr;
-  QLabel* badgeCapture_ = nullptr;
   QLabel* badgeCodec_ = nullptr;
-  QLabel* badgeLoss_ = nullptr;
+  // progress 回调是累计值，用于换算实时帧率与带宽。
+  int lastProgressFrames_ = -1;
+  qlonglong lastProgressBytes_ = 0;
+  std::chrono::steady_clock::time_point lastProgressTime_;
 
   // 被控端与主控端各占一个线程：HostRunner / ClientRunner 都是阻塞运行，
   // 共用线程会导致开启被控后无法再连接其他设备。

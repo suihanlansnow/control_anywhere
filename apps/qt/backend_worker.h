@@ -28,6 +28,8 @@ class BackendWorker : public QObject {
   void stop();
   // 临时关闭/恢复远程键鼠注入；会话保持连接，仅影响输入。
   void setInputEnabled(bool enabled);
+  // 主控端断线后是否自动重连。
+  void setAutoReconnect(bool enabled);
 
  signals:
   void logMessage(const QString& tag, const QString& level, const QString& msg);
@@ -45,4 +47,6 @@ class BackendWorker : public QObject {
   std::atomic<bool> stopping_{false};
   // 重启被控会话后仍保持用户选择的输入开关状态。
   std::atomic<bool> input_enabled_{true};
+  // 主控端断线自动重连，运行期可改。
+  std::atomic<bool> auto_reconnect_{true};
 };

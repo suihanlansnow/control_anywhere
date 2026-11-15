@@ -474,7 +474,8 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id) {
 
 int HostRunner::run() {
   std::string error;
-  TcpSocket socket = TcpSocket::connect(cfg_.relay_host, cfg_.relay_port, &error);
+  TcpSocket socket = TcpSocket::connect(cfg_.relay_host, cfg_.relay_port, &error,
+                                        cfg_.connect_timeout_ms, cfg_.tcp_no_delay);
   if (!socket.valid()) {
     log_("ERROR", "host", "relay connect failed: " + error);
     return 2;
@@ -638,7 +639,8 @@ int ClientRunner::run() {
   }
 
   std::string error;
-  TcpSocket socket = TcpSocket::connect(cfg_.relay_host, cfg_.relay_port, &error);
+  TcpSocket socket = TcpSocket::connect(cfg_.relay_host, cfg_.relay_port, &error,
+                                        cfg_.connect_timeout_ms, cfg_.tcp_no_delay);
   if (!socket.valid()) {
     log_("ERROR", "ctrl", "relay connect failed: " + error);
     return 2;

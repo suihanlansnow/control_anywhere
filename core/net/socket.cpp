@@ -15,9 +15,11 @@ using native_socket = SOCKET;
 #define RC_CLOSE_SOCKET closesocket
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -36,6 +38,51 @@ intptr_t from_native(native_socket fd) { return static_cast<intptr_t>(fd); }
 #ifdef _WIN32
 std::once_flag g_wsa_once;
 #endif
+
+bool set_nonblocking(native_socket fd, bool enabled) {
+#ifdef _WIN32
+  u_long mode = enabled ? 1 : 0;
+  return ::ioctlsocket(fd, FIONBIO, &mode) == 0;
+#else
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return false;
+  const int next = enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+  return ::fcntl(fd, F_SETFL, next) == 0;
+#endif
+}
+
+// 等待非阻塞 connect 完成；返回 true 表示连接成功。
+bool wait_connect(native_socket fd, int timeout_ms) {
+  fd_set writable;
+  fd_set failed;
+  FD_ZERO(&writable);
+  FD_ZERO(&failed);
+  FD_SET(fd, &writable);
+  FD_SET(fd, &failed);
+
+  timeval tv{};
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+#ifdef _WIN32
+  const int rc = ::select(0, nullptr, &writable, &failed, &tv);
+#else
+  const int rc = ::select(fd + 1, nullptr, &writable, &failed, &tv);
+#endif
+  if (rc <= 0) return false;
+
+  int socket_error = 0;
+#ifdef _WIN32
+  int length = sizeof(socket_error);
+#else
+  socklen_t length = sizeof(socket_error);
+#endif
+  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                   reinterpret_cast<char*>(&socket_error), &length) != 0) {
+    return false;
+  }
+  return socket_error == 0;
+}
 
 }  // namespace
 
@@ -185,7 +232,8 @@ void TcpSocket::set_send_timeout_ms(int milliseconds) {
 }
 
 TcpSocket TcpSocket::connect(const std::string& host, uint16_t port,
-                             std::string* error) {
+                             std::string* error, int timeout_ms,
+                             bool no_delay) {
   net_init();
 
   addrinfo hints{};
@@ -206,10 +254,33 @@ TcpSocket TcpSocket::connect(const std::string& host, uint16_t port,
     native_socket fd = ::socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
     if (fd == static_cast<native_socket>(-1)) continue;
 
-    if (::connect(fd, entry->ai_addr, static_cast<int>(entry->ai_addrlen)) == 0) {
-      int no_delay = 1;
-      ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
-                   reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
+    bool connected = false;
+    if (timeout_ms <= 0) {
+      connected = ::connect(fd, entry->ai_addr, static_cast<int>(entry->ai_addrlen)) == 0;
+    } else if (set_nonblocking(fd, true)) {
+      // 非阻塞 connect + select，避免对端不可达时卡在内核默认超时（可达 20s+）。
+      const int started = ::connect(fd, entry->ai_addr, static_cast<int>(entry->ai_addrlen));
+      if (started == 0) {
+        connected = true;
+      } else {
+#ifdef _WIN32
+        const bool in_progress = ::WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        const bool in_progress = errno == EINPROGRESS;
+#endif
+        connected = in_progress && wait_connect(fd, timeout_ms);
+      }
+      set_nonblocking(fd, false);
+    } else {
+      connected = ::connect(fd, entry->ai_addr, static_cast<int>(entry->ai_addrlen)) == 0;
+    }
+
+    if (connected) {
+      if (no_delay) {
+        int value = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                     reinterpret_cast<const char*>(&value), sizeof(value));
+      }
       socket.fd_ = from_native(fd);
       break;
     }

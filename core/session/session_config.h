@@ -20,6 +20,10 @@ struct SessionConfig {
   int quality = 75;
   int monitor = 0;
   int max_frames = 0;
+  // 连接中继的超时（毫秒），<=0 表示使用系统默认。
+  int connect_timeout_ms = 5000;
+  // 默认开启 TCP_NODELAY，交互式鼠标/键盘对延迟敏感。
+  bool tcp_no_delay = true;
   bool render = true;
 };
 
