@@ -38,6 +38,11 @@ struct SessionConfig {
   // 证书主机名；留空时按 "relay" 校验（自签证书通常配指纹固定）。
   std::string tls_server_name;
   bool tls_insecure = false;
+  // 会话建立前是否要求本机确认（Qt 默认开启，CLI 用 --confirm 开启）。
+  // 无人值守部署应保持关闭，否则没人点“允许”会一直拒绝连接。
+  bool require_confirmation = false;
+  // 等待本机确认的超时（毫秒），超时按拒绝处理。
+  int confirm_timeout_ms = 30000;
   int fps = 60;
   int quality = 75;
   int monitor = 0;

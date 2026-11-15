@@ -45,6 +45,22 @@ static constexpr const char* kInputBackendName = "SendInput";
 
 static json::Value make_object() { return json::Value::make_object(); }
 
+static uint64_t monotonic_ms() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+// 鉴权失败限制：同一主控设备号连续失败 5 次后锁定 30 秒，之后每多失败一次翻倍，
+// 上限 30 分钟；另有 60 秒全局窗口，窗口内失败达到 10 次时拒绝新会话，
+// 避免攻击者轮换设备号绕过单设备号的锁定。
+static constexpr int kAuthFreeAttempts = 5;
+static constexpr uint64_t kAuthBaseLockMs = 30000;
+static constexpr uint64_t kAuthMaxLockMs = 30ull * 60 * 1000;
+static constexpr uint64_t kAuthGlobalWindowMs = 60000;
+static constexpr std::size_t kAuthGlobalLimit = 10;
+
 // role 决定中继是否要求设备身份：只有被控端（可被连接的目标）必须证明归属，
 // 主控端不参与 device_id 抢注，保持轻量注册。
 static bool send_register_cfg(Connection& conn, const SessionConfig& cfg,
@@ -1037,6 +1053,51 @@ int HostRunner::run() {
   SessionGuard guard;
   uint64_t session_id = 0;
   std::vector<uint8_t> nonce;
+  // 当前会话的主控设备号，用于记录鉴权失败次数。
+  std::string peer_id;
+
+  auto auth_locked_ms = [this](const std::string& id) -> uint64_t {
+    const uint64_t now = monotonic_ms();
+    std::lock_guard<std::mutex> lock(auth_mutex_);
+    while (!recent_failures_ms_.empty() &&
+           now - recent_failures_ms_.front() > kAuthGlobalWindowMs) {
+      recent_failures_ms_.pop_front();
+    }
+    if (recent_failures_ms_.size() >= kAuthGlobalLimit) {
+      return kAuthGlobalWindowMs - (now - recent_failures_ms_.front());
+    }
+    auto it = auth_failures_.find(id);
+    if (it != auth_failures_.end() && it->second.locked_until_ms > now) {
+      return it->second.locked_until_ms - now;
+    }
+    return 0;
+  };
+
+  auto note_auth_failure = [this](const std::string& id) {
+    const uint64_t now = monotonic_ms();
+    std::lock_guard<std::mutex> lock(auth_mutex_);
+    recent_failures_ms_.push_back(now);
+    while (!recent_failures_ms_.empty() &&
+           now - recent_failures_ms_.front() > kAuthGlobalWindowMs) {
+      recent_failures_ms_.pop_front();
+    }
+    AuthFailure& entry = auth_failures_[id];
+    ++entry.count;
+    if (entry.count >= kAuthFreeAttempts) {
+      uint64_t lock_ms = kAuthBaseLockMs;
+      for (int i = kAuthFreeAttempts; i < entry.count && lock_ms < kAuthMaxLockMs; ++i) {
+        lock_ms *= 2;
+      }
+      if (lock_ms > kAuthMaxLockMs) lock_ms = kAuthMaxLockMs;
+      entry.locked_until_ms = now + lock_ms;
+    }
+  };
+
+  auto note_auth_success = [this](const std::string& id) {
+    std::lock_guard<std::mutex> lock(auth_mutex_);
+    auth_failures_.erase(id);
+    recent_failures_ms_.clear();
+  };
 
   while (!stop_flag_.load()) {
     DecodedFrame frame;
@@ -1093,11 +1154,42 @@ int HostRunner::run() {
         session_id = frame.session_id;
         json::Value payload = parse_payload_cfg(frame);
         std::string from = "unknown";
+        std::string from_alias;
         if (const json::Value* from_field = payload.get("from")) {
           if (const json::Value* id_field = from_field->get("id")) {
             from = id_field->as_string("unknown");
           }
+          if (const json::Value* alias_field = from_field->get("alias")) {
+            from_alias = alias_field->as_string("");
+          }
         }
+        peer_id = from;
+
+        // 鉴权失败限制：锁定期间直接拒绝，不进入密码校验阶段。
+        const uint64_t locked_ms = auth_locked_ms(from);
+        if (locked_ms > 0) {
+          json::Value reject = make_object();
+          reject.set("reason", "too_many_attempts");
+          conn.send_json(MsgType::SessionReject, session_id, reject);
+          log_("WARN", "host", "session rejected: too many auth failures, retry after " +
+                                    std::to_string((locked_ms + 999) / 1000) + "s");
+          session_id = 0;
+          break;
+        }
+
+        // 人工确认：回调会阻塞到本机用户选择允许/拒绝或超时。
+        if (cfg_.require_confirmation && confirm_cb_) {
+          const bool allowed = confirm_cb_(session_id, from, from_alias);
+          if (!allowed) {
+            json::Value reject = make_object();
+            reject.set("reason", "rejected_by_user");
+            conn.send_json(MsgType::SessionReject, session_id, reject);
+            log_("WARN", "host", "session rejected by local user (" + from + ")");
+            session_id = 0;
+            break;
+          }
+        }
+
         // 主控在 ConnectReq.want 里声明可接受的最高帧率，这里记录后按需降帧编码。
         requested_fps_.store(0);  // 本次邀请未声明时不能沿用上一会话的值
         requested_transport_.clear();
@@ -1190,14 +1282,16 @@ int HostRunner::run() {
         }
 #endif
         if (!ok) {
+          note_auth_failure(peer_id);
           result.set("reason", "bad password");
         } else {
+          note_auth_success(peer_id);
           result.set("transport", transport);
         }
         conn.send_json(MsgType::AuthResult, session_id, result);
 
         if (!ok) {
-          log_("WARN", "host", "authentication failed");
+          log_("WARN", "host", "authentication failed (" + peer_id + ")");
           guard.move_to(SessionState::Registered);
           session_id = 0;
           nonce.clear();

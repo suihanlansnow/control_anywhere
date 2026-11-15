@@ -4,6 +4,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -41,6 +43,12 @@ class HostRunner {
   void set_log_callback(LogCallback cb) { log_cb_ = std::move(cb); }
   void set_status_callback(StatusCallback cb) { status_cb_ = std::move(cb); }
   void set_progress_callback(ProgressCallback cb) { progress_cb_ = std::move(cb); }
+  // 会话建立前的人工确认：参数为 session_id、主控设备号、别名；
+  // 返回 false 表示拒绝。回调在工作线程执行，允许阻塞到用户作出选择。
+  using ConfirmCallback = std::function<bool(uint64_t session_id,
+                                             const std::string& peer_id,
+                                             const std::string& peer_alias)>;
+  void set_confirm_callback(ConfirmCallback cb) { confirm_cb_ = std::move(cb); }
 
   // 临时关闭远程键鼠注入，会话保持连接、继续推流，仅允许观看。
   void set_input_enabled(bool enabled);
@@ -69,6 +77,17 @@ class HostRunner {
   LogCallback log_cb_;
   StatusCallback status_cb_;
   ProgressCallback progress_cb_;
+  ConfirmCallback confirm_cb_;
+
+  // 鉴权失败限制：按主控设备号计数并指数退避，另设 60 秒全局失败窗口，
+  // 避免攻击者轮换设备号绕过单设备号的锁定。
+  struct AuthFailure {
+    int count = 0;
+    uint64_t locked_until_ms = 0;
+  };
+  std::mutex auth_mutex_;
+  std::map<std::string, AuthFailure> auth_failures_;
+  std::deque<uint64_t> recent_failures_ms_;
 };
 
 class ClientRunner {

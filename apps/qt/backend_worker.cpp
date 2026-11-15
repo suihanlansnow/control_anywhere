@@ -28,6 +28,12 @@ void BackendWorker::startHost(const rc::SessionConfig& cfg) {
       emit progressUpdated(static_cast<int>(frames),
                            static_cast<qlonglong>(bytes));
     });
+    confirm_timeout_ms_.store(cfg.confirm_timeout_ms > 0 ? cfg.confirm_timeout_ms : 30000);
+    host_->set_confirm_callback(
+        [this](uint64_t session_id, const std::string& peer_id,
+               const std::string& peer_alias) {
+          return requestConfirmation(session_id, peer_id, peer_alias);
+        });
     const int rc = host_->run();
     {
       std::lock_guard<std::mutex> lock(runner_mutex_);
@@ -110,9 +116,44 @@ void BackendWorker::sendFile(const QString& path) {
 
 void BackendWorker::stop() {
   stopping_.store(true);
+  // 唤醒可能正在等待用户确认的工作线程，按拒绝退出，避免 stop 卡到超时。
+  {
+    std::lock_guard<std::mutex> lock(confirm_mutex_);
+    confirm_pending_ = false;
+    confirm_decision_ = false;
+  }
+  confirm_cv_.notify_all();
   std::lock_guard<std::mutex> lock(runner_mutex_);
   if (host_) host_->stop();
   if (client_) client_->stop();
+}
+
+bool BackendWorker::requestConfirmation(uint64_t session_id, const std::string& peer_id,
+                                        const std::string& peer_alias) {
+  std::unique_lock<std::mutex> lock(confirm_mutex_);
+  confirm_pending_ = true;
+  confirm_decision_ = false;
+  // 工作线程发出的信号会排队到 UI 线程，弹窗期间本线程在此等待。
+  emit confirmationRequested(static_cast<qulonglong>(session_id),
+                             QString::fromStdString(peer_id),
+                             QString::fromStdString(peer_alias));
+  const int timeout = confirm_timeout_ms_.load();
+  const bool replied = confirm_cv_.wait_for(
+      lock, std::chrono::milliseconds(timeout),
+      [this] { return !confirm_pending_ || stopping_.load(); });
+  const bool allowed = replied && confirm_decision_ && !stopping_.load();
+  confirm_pending_ = false;
+  return allowed;
+}
+
+void BackendWorker::answerConfirmation(bool allow) {
+  {
+    std::lock_guard<std::mutex> lock(confirm_mutex_);
+    if (!confirm_pending_) return;
+    confirm_decision_ = allow;
+    confirm_pending_ = false;
+  }
+  confirm_cv_.notify_all();
 }
 
 void BackendWorker::setInputEnabled(bool enabled) {

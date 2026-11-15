@@ -50,6 +50,8 @@ class MainWindow : public QMainWindow {
   void onLogMsg(const QString& tag, const QString& level, const QString& msg);
   void onProgressUpdated(int frames, qlonglong bytes);
   void onFrameReady(QImage image);
+  void onConfirmationRequested(qulonglong sessionId, const QString& peerId,
+                               const QString& peerAlias);
   void onHostFinished(int rc);
   void onClientFinished(int rc);
   void onTrayActivated(QSystemTrayIcon::ActivationReason reason);
@@ -85,6 +87,8 @@ class MainWindow : public QMainWindow {
   QPushButton* btnHostStart_ = nullptr;
   QPushButton* btnHostStop_ = nullptr;
   QCheckBox* switchRemoteInput_ = nullptr;
+  // 有主控端请求连接时在本机弹窗确认（无人值守可关闭）。
+  QCheckBox* switchConfirm_ = nullptr;
 
   // 连接远程设备
   QLineEdit* editRelayHost_ = nullptr;

@@ -39,6 +39,7 @@ static constexpr const char* kPlatformName = "Linux";
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QListWidget>
 #include <QMouseEvent>
 #include <QPainter>
@@ -374,6 +375,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   connect(hostWorker_, &BackendWorker::logMessage, this, &MainWindow::onLogMsg);
   connect(hostWorker_, &BackendWorker::statusChanged, this, &MainWindow::onHostStatus);
   connect(hostWorker_, &BackendWorker::finished, this, &MainWindow::onHostFinished);
+  connect(hostWorker_, &BackendWorker::confirmationRequested, this,
+          &MainWindow::onConfirmationRequested);
   hostThread_->start();
 
   clientThread_ = new QThread(this);
@@ -637,6 +640,20 @@ QWidget* MainWindow::buildConnectPanel() {
     inputRow->addWidget(switchRemoteInput_);
     inputRow->addWidget(inputHint);
     vbox->addLayout(inputRow);
+
+    vbox->addSpacing(8);
+    auto* confirmRow = new QVBoxLayout();
+    confirmRow->setSpacing(2);
+    switchConfirm_ = new QCheckBox(tr("连接前需要本机确认"));
+    switchConfirm_->setObjectName("Switch");
+    switchConfirm_->setChecked(true);
+    auto* confirmHint =
+        new QLabel(tr("有主控端请求连接时弹窗询问；无人值守运行请取消勾选"));
+    confirmHint->setObjectName("FieldHint");
+    confirmHint->setWordWrap(true);
+    confirmRow->addWidget(switchConfirm_);
+    confirmRow->addWidget(confirmHint);
+    vbox->addLayout(confirmRow);
 
     vbox->addSpacing(8);
     auto* statusRow = new QHBoxLayout();
@@ -1237,6 +1254,8 @@ void MainWindow::onStartHost() {
   cfg.tls_fingerprint = editTlsFingerprint_ ? editTlsFingerprint_->text().trimmed().toStdString()
                                             : std::string();
   cfg.tls_insecure = cfg.tls && cfg.tls_fingerprint.empty();
+  cfg.require_confirmation = switchConfirm_ ? switchConfirm_->isChecked() : true;
+  cfg.confirm_timeout_ms = 30000;
 
   hostState_ = "connecting";
   if (hostStatusLabel_) hostStatusLabel_->setText(tr("正在开启被控端…"));
@@ -1477,6 +1496,22 @@ void MainWindow::onFrameReady(QImage image) {
   static_cast<VideoWidget*>(videoView_)->setFrame(image);
 }
 
+void MainWindow::onConfirmationRequested(qulonglong sessionId, const QString& peerId,
+                                         const QString& peerAlias) {
+  Q_UNUSED(sessionId);
+  const QString who =
+      peerAlias.isEmpty() ? peerId : tr("%1（%2）").arg(peerAlias, peerId);
+  // 工作线程正阻塞等待结果，这里必须弹窗并回答，否则超时后按拒绝处理。
+  const auto answer =
+      QMessageBox::question(this, tr("远程连接请求"),
+                            tr("%1 请求连接并控制本机，是否允许？").arg(who),
+                            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+  const bool allow = answer == QMessageBox::Yes;
+  if (hostWorker_) hostWorker_->answerConfirmation(allow);
+  RC_LOGI("ui", std::string("remote control request from ") + peerId.toStdString() +
+                    (allow ? " allowed" : " denied"));
+}
+
 void MainWindow::onHostFinished(int rc) {
   Q_UNUSED(rc);
   hostState_ = "closed";
@@ -1500,6 +1535,7 @@ void MainWindow::saveSettings() {
              editTlsFingerprint_ ? editTlsFingerprint_->text() : "");
   s.setValue("device/id", editDeviceId_ ? editDeviceId_->text() : "");
   s.setValue("security/password", editPassword_ ? editPassword_->text() : "");
+  s.setValue("security/confirm", switchConfirm_ ? switchConfirm_->isChecked() : true);
   s.setValue("client/target", editTargetId_ ? editTargetId_->text() : "");
   s.setValue("client/password", editConnectPassword_ ? editConnectPassword_->text() : "");
   s.setValue("display/auto_bitrate", switchAutoBitrate_ ? switchAutoBitrate_->isChecked() : false);
@@ -1528,6 +1564,7 @@ void MainWindow::loadSettings() {
   if (spinRelayPort_) spinRelayPort_->setValue(s.value("relay/port", 21116).toInt());
   if (editDeviceId_) editDeviceId_->setText(s.value("device/id", "").toString());
   if (editPassword_) editPassword_->setText(s.value("security/password", "").toString());
+  if (switchConfirm_) switchConfirm_->setChecked(s.value("security/confirm", true).toBool());
   if (editTargetId_) editTargetId_->setText(s.value("client/target", "").toString());
   if (editConnectPassword_) {
     editConnectPassword_->setText(s.value("client/password", "").toString());
