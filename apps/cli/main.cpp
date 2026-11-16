@@ -25,6 +25,7 @@
 #include "base/json.h"
 #include "base/log.h"
 #include "capture/capture.h"
+#include "codec/codec_registry.h"
 #include "codec/encoder.h"
 #include "codec/decoder.h"
 #include "render/renderer.h"
@@ -63,7 +64,7 @@ struct Options {
 #else
   std::string capture = "dxgi";
 #endif
-  std::string codec = "h264";
+  std::string codec = "auto";
   // "tcp"（默认）或 "webrtc"；WebRTC 需要构建时开启 RC_ENABLE_WEBRTC。
   std::string transport = "tcp";
   // ICE 服务器；留空时使用中继在 RegisterAck 下发的配置。
@@ -98,14 +99,14 @@ void print_usage() {
       "           [--tls-cert relay.pem --tls-key relay-key.pem]\n"
       "  rc-cli host    --id <设备号> [--alias 名称] --password <密码> "
       "[--relay 127.0.0.1:21116]\n"
-      "                 [--capture dxgi|synthetic] [--codec h264|jpeg] [--fps 60] "
+      "                 [--capture dxgi|synthetic] [--codec auto|vp9|h264] [--fps 60] "
       "[--quality 75] [--monitor 0] [--frames 60] [--clipboard] [--file-transfer]\n"
       "                 [--identity identity.pem] [--confirm]\n"
       "                 [--tls [--tls-ca CA.pem | --tls-fingerprint SHA256 | --tls-insecure]]\n"
       "                 [--stun host:port] [--turn [user:pass@]host:port] "
       "[--ice-relay] [--ice-tcp]\n"
       "  rc-cli connect <目标设备号> --password <密码> "
-      "[--relay 127.0.0.1:21116] [--frames 30]\n"
+      "[--relay 127.0.0.1:21116] [--frames 30] [--codec auto|vp9|h264]\n"
       "                 [--transport tcp|webrtc] [--render|--no-render] [--clipboard] "
       "[--send-file 文件]...\n"
       "                 [--tls [--tls-ca CA.pem | --tls-fingerprint SHA256 | --tls-insecure]]\n"
@@ -296,7 +297,7 @@ bool send_register(Connection& conn, const Options& opts, const char* tag) {
   request.set("app", "0.1.0");
   json::Value caps = object();
   json::Value codec = json::Value::make_array();
-  codec.push(opts.codec);
+  for (const std::string& name : encodable_codecs()) codec.push(name);
   caps.set("codec", codec);
   caps.set("input", true);
   request.set("caps", caps);
@@ -324,12 +325,23 @@ int stream_frames(Connection& conn, const Options& opts, uint64_t session_id) {
     }
   }
 
+  // 直连演示路径不走协商：auto 时按本端实际可用能力选第一个。
+  std::string codec = opts.codec;
+  if (codec == "auto") {
+    const std::vector<std::string> available = encodable_codecs();
+    if (available.empty()) {
+      RC_LOGE("host", "no usable video encoder");
+      return 0;
+    }
+    codec = available.front();
+  }
+
   // H.264 编码器直接吃 NV12：让采集端在 GPU 上转换，省掉 8MB 回读和 CPU 逐像素转换。
-  if (opts.codec == "h264" && !capture->set_output_format(PixelFormat::kNV12)) {
+  if (codec == "h264" && !capture->set_output_format(PixelFormat::kNV12)) {
     RC_LOGW("host", "capture cannot output nv12, using bgra");
   }
 
-  std::unique_ptr<IVideoEncoder> encoder = create_encoder(opts.codec, &error);
+  std::unique_ptr<IVideoEncoder> encoder = create_encoder(codec, &error);
   if (!encoder) {
     RC_LOGE("host", "encoder unavailable: " << error);
     return 0;

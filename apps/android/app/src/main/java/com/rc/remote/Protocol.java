@@ -22,10 +22,12 @@ final class Protocol {
     static final int AUTH_RESPONSE = 0x14;
     static final int AUTH_RESULT = 0x15;
     static final int SESSION_CLOSE = 0x16;
+    static final int CAPS_NEGOTIATE = 0x18;
     static final int MOUSE_MOVE = 0x20;
     static final int MOUSE_BUTTON = 0x21;
     static final int MOUSE_WHEEL = 0x22;
     static final int KEY = 0x23;
+    static final int VIDEO_CONFIG = 0x30;
     static final int VIDEO_FRAME = 0x31;
     static final int ERROR = 0x61;
 

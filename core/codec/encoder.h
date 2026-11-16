@@ -10,7 +10,7 @@
 namespace rc {
 
 // codec 取值与 VIDEO_FRAME 协议字段一致。
-enum class VideoCodec : uint8_t { H264 = 1, H265 = 2, AV1 = 3, Jpeg = 4 };
+enum class VideoCodec : uint8_t { H264 = 1, H265 = 2, AV1 = 3, Jpeg = 4, Vp9 = 5 };
 
 struct EncodedFrame {
   VideoCodec codec = VideoCodec::Jpeg;
@@ -42,9 +42,11 @@ class IVideoEncoder {
   // open() 之后可用：MFT 使用的 MF 设备管理器，采集端据此串行化 GPU 访问。
   virtual void* native_device_manager() { return nullptr; }
   virtual const char* name() const = 0;
+  // 实际使用的后端是否为硬件编码（用于能力上报与前端展示）。
+  virtual bool is_hardware() const { return false; }
 };
 
-// kind: "jpeg"（Windows WIC）
+// kind: "jpeg"（Windows WIC）、"h264"、"vp9"
 std::unique_ptr<IVideoEncoder> create_encoder(const std::string& kind,
                                               std::string* error);
 

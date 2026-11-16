@@ -58,7 +58,7 @@ struct Options {
   std::string device_id = "web-client";
   std::string alias = "web";
   std::string password;
-  std::string codec = "h264";
+  std::string codec = "auto";
   int fps = 15;
   int quality = 70;
 };
@@ -69,7 +69,7 @@ void print_usage() {
       "              [--http-port 8080] [--listen 127.0.0.1] [--token <访问令牌>]\n"
       "              [--relay 127.0.0.1:21116]\n"
       "              [--device-id web-client] [--fps 15] [--quality 70]\n"
-      "              [--codec h264]\n"
+      "              [--codec auto|vp9|h264]\n"
       "\n"
       "--target/--password 可省略：省略时启动后仅提供网页，由浏览器填写\n"
       "被控端设备 ID 与密码后再建立会话。\n"

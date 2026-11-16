@@ -17,7 +17,9 @@ struct SessionConfig {
   // 设备身份私钥文件；留空时用 DeviceIdentity::default_path()。
   // 仅被控端注册时需要，用于向中继证明 device_id 归属。
   std::string identity_path;
-  std::string codec = "h264";
+  // 视频编码选择："auto"（默认，被控端优先 VP9，不可用则 H.264）、
+  // "vp9" 或 "h264"（强制指定，不可用时协商失败，不做静默降级）。
+  std::string codec = "auto";
   std::string capture;
   // 视频传输方式："tcp"（默认，走中继的 24 字节帧）或 "webrtc"（RTP/SCTP，
   // 信令仍复用同一条中继连接）。主控端声明，被控端按需创建 PeerConnection。

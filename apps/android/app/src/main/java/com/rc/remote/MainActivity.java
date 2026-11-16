@@ -54,7 +54,7 @@ public final class MainActivity extends Activity {
     private int connectionGeneration;
     private String terminalError;
 
-    private final H264Decoder.Listener decoderListener = new H264Decoder.Listener() {
+    private final VideoDecoder.Listener decoderListener = new VideoDecoder.Listener() {
         @Override
         public void onFirstFrame() {
             runOnUiThread(() -> {
@@ -329,6 +329,11 @@ public final class MainActivity extends Activity {
                     }
 
                     @Override
+                    public void onCodecSelected(String codec) {
+                        if (generation == connectionGeneration) surface.setCodec(codec);
+                    }
+
+                    @Override
                     public void onVideoFrame(byte[] payload) {
                         if (generation == connectionGeneration) surface.offerFrame(payload);
                     }
@@ -365,7 +370,8 @@ public final class MainActivity extends Activity {
         loginView.setVisibility(View.VISIBLE);
         connectButton.setEnabled(true);
         connectButton.setText("连接远程桌面");
-        boolean error = status.startsWith("连接结束") || status.startsWith("H.264");
+        boolean error = status.startsWith("连接结束") || status.startsWith("VP9")
+                || status.startsWith("H.264");
         setLoginStatus(status, error);
     }
 

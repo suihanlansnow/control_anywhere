@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "base/clock.h"
+#include "codec/codec_registry.h"
 #include "crypto/device_identity.h"
 #include "crypto/hash.h"
 #include "net/connection.h"
@@ -96,19 +97,44 @@ static json::Value parse_payload_cfg(const DecodedFrame& frame) {
   }
 }
 
-// 主控能力列表里优先保留被控端当前编码；对方不支持时退回 jpeg（两端都有实现）。
-static std::string pick_codec(const std::string& host_codec, const json::Value* codecs) {
-  if (!codecs || !codecs->is_array() || codecs->size() == 0) return host_codec;
-  for (std::size_t i = 0; i < codecs->size(); ++i) {
-    if (codecs->at(i).as_string() == host_codec) return host_codec;
+// 被控端按"本端可编码能力 + 本端偏好"决定最终编码，主控端只声明自己可解码的列表。
+// 任一端显式指定 vp9/h264 时不做跨编码降级，协商不到就明确失败。
+static std::string negotiate_codec(const std::string& host_pref,
+                                   const std::vector<std::string>& host_codecs,
+                                   const std::vector<std::string>& client_codecs,
+                                   std::string* reason) {
+  const auto client_has = [&](const std::string& name) {
+    return std::find(client_codecs.begin(), client_codecs.end(), name) !=
+           client_codecs.end();
+  };
+
+  if (host_codecs.empty()) {
+    *reason = "host has no usable video encoder";
+    return "";
   }
-  for (std::size_t i = 0; i < codecs->size(); ++i) {
-    if (codecs->at(i).as_string() == "jpeg") return "jpeg";
+  if (client_codecs.empty()) {
+    *reason = "controller reported no video decoder";
+    return "";
   }
-  for (std::size_t i = 0; i < codecs->size(); ++i) {
-    if (codecs->at(i).as_string() == "h264") return "h264";
+
+  std::vector<std::string> candidates;
+  if (host_pref == "auto") {
+    candidates = host_codecs;
+  } else {
+    candidates.push_back(host_pref);
+    if (std::find(host_codecs.begin(), host_codecs.end(), host_pref) ==
+        host_codecs.end()) {
+      *reason = "host cannot encode " + host_pref;
+      return "";
+    }
   }
-  return host_codec;
+
+  for (const std::string& candidate : candidates) {
+    if (client_has(candidate)) return candidate;
+  }
+
+  *reason = "no common video codec";
+  return "";
 }
 
 // 本端已实现的可协商特性；未实现的不会回执给主控端。
@@ -355,7 +381,13 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
   }
 
   // CapsNegotiate 已按主控能力收敛过；未协商时沿用本端配置。
-  const std::string codec = negotiated_codec_.empty() ? cfg_.codec : negotiated_codec_;
+  std::string codec = negotiated_codec_.empty() ? cfg_.codec : negotiated_codec_;
+  if (codec == "auto") {
+    // 未经过协商的直连路径：按本端实际能力取第一个可编码项。
+    const std::vector<std::string> available = encodable_codecs();
+    codec = available.empty() ? "h264" : available.front();
+    log_("INFO", "host", "codec=auto resolved to " + codec + " before negotiation");
+  }
   const int quality = negotiated_quality_ > 0 ? negotiated_quality_ : cfg_.quality;
 
   // B5: H.264 编码器直接吃 NV12，省掉 8MB 回读和 CPU 逐像素转换。
@@ -557,12 +589,16 @@ int HostRunner::stream_frames_(Connection& conn, uint64_t session_id,
   if (bitrate_kbps > 0) video_cfg.set("bitrate_kbps", bitrate_kbps);
   video_cfg.set("keyframe_interval", fps);
   video_cfg.set("transport", active_transport);
+  video_cfg.set("encoder", encoder->name());
+  video_cfg.set("hardware", encoder->is_hardware());
   if (conn.send_json(MsgType::VideoConfig, session_id, video_cfg)) {
     log_("INFO", "host",
          "video config: codec=" + codec + " " + std::to_string(width) + "x" +
              std::to_string(height) + " fps=" + std::to_string(fps) + " quality=" +
              std::to_string(quality) +
              (bitrate_kbps > 0 ? " bitrate=" + std::to_string(bitrate_kbps) + "kbps" : "") +
+             " encoder=" + encoder->name() +
+             (encoder->is_hardware() ? "(hw)" : "(sw)") +
              " transport=" + active_transport);
   } else {
     log_("WARN", "host", "send video config failed");
@@ -1226,8 +1262,47 @@ int HostRunner::run() {
         if (frame.session_id != session_id) break;
         json::Value payload = parse_payload_cfg(frame);
         caps_negotiated_ = true;
-        negotiated_codec_ = pick_codec(cfg_.codec, payload.get("codec"));
-        // WebRTC 视频轨只打包 H.264；协商到其它编码时退回 TCP，避免建出无法解码的会话。
+
+        std::vector<std::string> client_codecs;
+        const json::Value* client_list = payload.get("codec");
+        if (client_list && client_list->is_array()) {
+          for (std::size_t i = 0; i < client_list->size(); ++i) {
+            client_codecs.push_back(client_list->at(i).as_string());
+          }
+        }
+        // 能力列表来自实际探测：只有真正打开成功并能产出一帧的编码器才会列出。
+        const std::vector<std::string> host_codecs = encodable_codecs();
+        std::string codec_reason;
+        negotiated_codec_ =
+            negotiate_codec(cfg_.codec, host_codecs, client_codecs, &codec_reason);
+        if (negotiated_codec_.empty()) {
+          std::string host_summary;
+          for (const std::string& name : host_codecs) {
+            if (!host_summary.empty()) host_summary += ",";
+            host_summary += name;
+          }
+          log_("ERROR", "host",
+               "codec negotiation failed: " + codec_reason + " (host=" +
+                   (host_summary.empty() ? "none" : host_summary) + " pref=" +
+                   cfg_.codec + ")");
+          // 明确拒绝：不回退到用户未选择的编码，主控端据此终止会话。
+          json::Value reply = make_object();
+          reply.set("ok", false);
+          reply.set("reason", codec_reason);
+          json::Value available = json::Value::make_array();
+          for (const std::string& name : host_codecs) available.push(name);
+          reply.set("available_codecs", available);
+          conn.send_json(MsgType::CapsNegotiate, session_id, reply);
+          json::Value close = make_object();
+          close.set("reason", "no_common_codec");
+          conn.send_json(MsgType::SessionClose, session_id, close);
+          caps_negotiated_ = false;
+          guard.move_to(SessionState::Registered);
+          session_id = 0;
+          if (status_cb_) status_cb_("registered");
+          break;
+        }
+        // WebRTC 视频轨当前只打包 H.264；协商到其它编码时退回 TCP，避免建出无法解码的会话。
         if (requested_transport_ == "webrtc" && negotiated_codec_ != "h264") {
           log_("WARN", "webrtc",
                "caps negotiated codec=" + negotiated_codec_ + ", falling back to tcp");
@@ -1264,6 +1339,8 @@ int HostRunner::run() {
         break;
       }
       case MsgType::AuthResponse: {
+        // 协商失败时已把 session_id 清零，迟到的鉴权包必须忽略。
+        if (frame.session_id != session_id) break;
         json::Value payload = parse_payload_cfg(frame);
         const std::string proof =
             payload.get("password_proof") ? payload.get("password_proof")->as_string() : "";
@@ -1552,7 +1629,8 @@ int ClientRunner::run() {
 
       if (!decoder) {
         std::string dec_error;
-        decoder = create_decoder(&dec_error);
+        decoder = create_decoder(
+            video_codec_.empty() ? std::string("h264") : video_codec_, &dec_error);
         if (!decoder) {
           log_("WARN", "ctrl", "decoder create failed: " + dec_error);
           continue;
@@ -1876,11 +1954,27 @@ int ClientRunner::run() {
         clipboard_session.store(session_id);
         guard.move_to(SessionState::Ready);
 
-        // 鉴权前先声明本端解码能力，让被控端在开编码器前收敛参数。
-        json::Value caps = make_object();
+        // 只声明本端真正能打开的解码器。显式选择 vp9/h264 时只声明该编码，
+        // 让协商明确失败，而不是静默降级到用户未选择的编码。
+        std::vector<std::string> client_codecs;
+        if (cfg_.codec == "vp9" || cfg_.codec == "h264") {
+          client_codecs.push_back(cfg_.codec);
+        } else {
+          client_codecs = decodable_codecs();
+        }
         json::Value codecs = json::Value::make_array();
-        codecs.push("h264");  // 当前主控端只实现 H.264 解码
+        for (const std::string& name : client_codecs) {
+          if (codec_availability(name).decode) codecs.push(name);
+        }
+        if (codecs.size() == 0) {
+          log_("ERROR", "ctrl",
+               "no usable video decoder for codec=" + cfg_.codec +
+                   " (check FFmpeg/libvpx availability)");
+          return 4;
+        }
+        json::Value caps = make_object();
         caps.set("codec", codecs);
+        caps.set("codec_preference", cfg_.codec);
         caps.set("max_fps", cfg_.fps);
         caps.set("quality", cfg_.quality);
         json::Value features = json::Value::make_array();
@@ -2066,8 +2160,17 @@ int ClientRunner::run() {
       case MsgType::CapsNegotiate: {
         // 被控端回执：实际采用的编码/分辨率/帧率/画质，以及双方都支持的特性。
         json::Value payload = parse_payload_cfg(frame);
+        const json::Value* ok_field = payload.get("ok");
+        if (ok_field && !ok_field->as_bool()) {
+          const json::Value* reason_field = payload.get("reason");
+          const std::string reason =
+              reason_field ? reason_field->as_string() : "unknown";
+          log_("ERROR", "ctrl", "codec negotiation rejected by host: " + reason);
+          return 4;
+        }
         const std::string codec =
             payload.get("codec") ? payload.get("codec")->as_string(cfg_.codec) : cfg_.codec;
+        video_codec_ = codec;
         const int caps_width =
             payload.get("width") ? static_cast<int>(payload.get("width")->as_int(0)) : 0;
         const int caps_height =
@@ -2116,6 +2219,11 @@ int ClientRunner::run() {
         json::Value payload = parse_payload_cfg(frame);
         const std::string codec =
             payload.get("codec") ? payload.get("codec")->as_string(cfg_.codec) : cfg_.codec;
+        video_codec_ = codec;
+        const std::string encoder_name =
+            payload.get("encoder") ? payload.get("encoder")->as_string() : "";
+        const bool hardware =
+            payload.get("hardware") ? payload.get("hardware")->as_bool() : false;
         const int cfg_width =
             payload.get("width") ? static_cast<int>(payload.get("width")->as_int(0)) : 0;
         const int cfg_height =
@@ -2131,7 +2239,10 @@ int ClientRunner::run() {
              "video config: codec=" + codec + " " + std::to_string(cfg_width) + "x" +
                  std::to_string(cfg_height) + " fps=" + std::to_string(cfg_fps) +
                  " quality=" + std::to_string(cfg_quality) +
-                 (cfg_kbps > 0 ? " bitrate=" + std::to_string(cfg_kbps) + "kbps" : ""));
+                 (cfg_kbps > 0 ? " bitrate=" + std::to_string(cfg_kbps) + "kbps" : "") +
+                 (encoder_name.empty()
+                      ? ""
+                      : " encoder=" + encoder_name + (hardware ? "(hw)" : "(sw)")));
         break;
       }
       case MsgType::VideoFrame: {

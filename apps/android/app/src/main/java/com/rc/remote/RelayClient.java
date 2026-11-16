@@ -1,7 +1,10 @@
 package com.rc.remote;
 
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.util.Base64;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -27,6 +30,7 @@ import javax.crypto.spec.SecretKeySpec;
 final class RelayClient {
     interface Listener {
         void onStatus(String status);
+        void onCodecSelected(String codec);
         void onVideoFrame(byte[] payload);
         void onDisconnected(String reason, boolean intentional);
     }
@@ -131,7 +135,8 @@ final class RelayClient {
                 requireOk(response, "远程设备拒绝了连接");
                 if (frame.sessionId == 0) throw new IOException("中继返回了无效会话");
                 sessionId = frame.sessionId;
-                listener.onStatus("远程设备已接受，正在鉴权");
+                listener.onStatus("远程设备已接受，正在协商编码");
+                sendCapsNegotiate();
                 break;
             }
             case Protocol.AUTH_CHALLENGE: {
@@ -147,6 +152,25 @@ final class RelayClient {
                 requireOk(result, "鉴权失败");
                 authenticated = true;
                 listener.onStatus("鉴权成功，正在接收远程画面");
+                break;
+            }
+            case Protocol.CAPS_NEGOTIATE: {
+                // 被控端回执：ok=false 表示双方没有共同编码，直接按错误终止会话。
+                JSONObject caps = json(frame);
+                if (!caps.optBoolean("ok", true)) {
+                    throw new IOException(localizeReason(
+                            caps.optString("reason", "两端没有共同的视频编码")));
+                }
+                listener.onCodecSelected(normalizeCodec(caps.optString("codec", "h264")));
+                break;
+            }
+            case Protocol.VIDEO_CONFIG: {
+                JSONObject config = json(frame);
+                String codec = normalizeCodec(config.optString("codec", "h264"));
+                listener.onCodecSelected(codec);
+                String encoder = config.optString("encoder", "");
+                listener.onStatus("视频编码 " + (codec.equals("vp9") ? "VP9" : "H.264")
+                        + (encoder.isEmpty() ? "" : "（" + encoder + "）"));
                 break;
             }
             case Protocol.VIDEO_FRAME:
@@ -181,7 +205,7 @@ final class RelayClient {
 
     private void sendRegister() throws Exception {
         JSONObject caps = new JSONObject();
-        caps.put("codec", new org.json.JSONArray().put("h264"));
+        caps.put("codec", decoderCodecs());
         caps.put("input", true);
         JSONObject request = new JSONObject();
         request.put("device_id", deviceId);
@@ -192,6 +216,40 @@ final class RelayClient {
         request.put("caps", caps);
         sendJson(Protocol.REGISTER, 0, request);
         listener.onStatus("已连接中继，正在注册");
+    }
+
+    /** 声明本机真正可解码的编码，被控端据此选择最终编码。 */
+    private void sendCapsNegotiate() throws Exception {
+        JSONObject caps = new JSONObject();
+        caps.put("codec", decoderCodecs());
+        caps.put("codec_preference", "auto");
+        caps.put("max_fps", 15);
+        JSONArray features = new JSONArray();
+        features.put("keyframe-request");
+        caps.put("features", features);
+        sendJson(Protocol.CAPS_NEGOTIATE, sessionId, caps);
+    }
+
+    private static JSONArray decoderCodecs() {
+        JSONArray codecs = new JSONArray();
+        codecs.put("h264");
+        if (hasDecoder(VideoDecoder.MIME_VP9)) codecs.put("vp9");
+        return codecs;
+    }
+
+    private static boolean hasDecoder(String mime) {
+        MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+        for (MediaCodecInfo info : list.getCodecInfos()) {
+            if (info.isEncoder()) continue;
+            for (String type : info.getSupportedTypes()) {
+                if (type.equalsIgnoreCase(mime)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static String normalizeCodec(String codec) {
+        return "vp9".equals(codec) ? "vp9" : "h264";
     }
 
     private void heartbeatLoop() {
@@ -330,6 +388,10 @@ final class RelayClient {
             case "bad password": return "远程访问密码错误";
             case "target offline": return "目标设备不在线或未注册到中继";
             case "user closed": return "已断开连接";
+            case "no common video codec": return "两端没有共同的视频编码";
+            case "host has no usable video encoder": return "被控端没有可用的视频编码器";
+            case "host cannot encode vp9": return "被控端不支持 VP9 编码";
+            case "host cannot encode h264": return "被控端不支持 H.264 编码";
             default: return reason;
         }
     }

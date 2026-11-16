@@ -111,6 +111,8 @@ class ClientRunner {
 
   SessionConfig cfg_;
   std::atomic<bool> stop_flag_{false};
+  // 被控端在 VideoConfig 里下发的实际编码；解码器按它创建。
+  std::string video_codec_;
   // 中继在 RegisterAck 下发的 ICE 服务器；本地 cfg_ 配置非空时优先使用本地。
   std::vector<std::string> relay_ice_servers_;
   LogCallback log_cb_;

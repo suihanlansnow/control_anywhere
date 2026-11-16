@@ -14,7 +14,7 @@ struct VideoFrameMeta {
   uint32_t frame_id = 0;
   uint16_t width = 0;
   uint16_t height = 0;
-  uint8_t codec = 4;  // 1=h264 2=h265 3=av1 4=jpeg
+  uint8_t codec = 4;  // 1=h264 2=h265 3=av1 4=jpeg 5=vp9
   bool keyframe = false;
   uint32_t data_len = 0;
 };

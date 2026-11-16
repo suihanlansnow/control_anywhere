@@ -103,6 +103,7 @@ class MainWindow : public QMainWindow {
   QPushButton* btnSendFile_ = nullptr;
 
   QCheckBox* switchAutoBitrate_ = nullptr;
+  QComboBox* comboCodec_ = nullptr;
 
   QSlider* sliderTimeout_ = nullptr;
   QLabel* labelTimeoutVal_ = nullptr;

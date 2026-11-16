@@ -18,7 +18,7 @@ final class RemoteSurfaceView extends SurfaceView implements SurfaceHolder.Callb
         void onRightButtonModeChanged(boolean enabled);
     }
 
-    private final H264Decoder decoder;
+    private final VideoDecoder decoder;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final float touchSlop;
     private RelayClient client;
@@ -57,9 +57,9 @@ final class RemoteSurfaceView extends SurfaceView implements SurfaceHolder.Callb
             (view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) ->
                     fitToContainer();
 
-    RemoteSurfaceView(Context context, H264Decoder.Listener decoderListener) {
+    RemoteSurfaceView(Context context, VideoDecoder.Listener decoderListener) {
         super(context);
-        decoder = new H264Decoder(decoderListener);
+        decoder = new VideoDecoder(decoderListener);
         touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
         getHolder().addCallback(this);
         setFocusable(true);
@@ -82,6 +82,11 @@ final class RemoteSurfaceView extends SurfaceView implements SurfaceHolder.Callb
 
     boolean isRightButtonMode() {
         return rightButtonMode;
+    }
+
+    /** 由网络线程在首帧前调用，指定被控端协商出的最终编码。 */
+    void setCodec(String codec) {
+        decoder.setCodec(codec);
     }
 
     /** 由网络线程调用，只更新尺寸并投递布局，避免跨线程操作视图。 */

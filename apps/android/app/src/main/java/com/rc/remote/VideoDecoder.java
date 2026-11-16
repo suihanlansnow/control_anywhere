@@ -7,12 +7,15 @@ import android.view.Surface;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
-/** Annex-B H.264 系统解码器，待解码队列深度始终为 1。 */
-final class H264Decoder {
+/** MediaCodec 视频解码器：按协商结果解 H.264 或 VP9，待解码队列深度始终为 1。 */
+final class VideoDecoder {
     interface Listener {
         void onFirstFrame();
         void onDecoderError(String message);
     }
+
+    static final String MIME_H264 = "video/avc";
+    static final String MIME_VP9 = "video/x-vnd.on2.vp9";
 
     private static final class Frame {
         final byte[] payload;
@@ -36,9 +39,24 @@ final class H264Decoder {
     private Thread worker;
     private boolean running;
     private Frame pending;
+    private volatile String mime = MIME_H264;
+    private volatile int codecId = 1;
 
-    H264Decoder(Listener listener) {
+    VideoDecoder(Listener listener) {
         this.listener = listener;
+    }
+
+    /** 由网络线程在首帧前调用：被控端协商出的最终编码，会话内不再变化。 */
+    void setCodec(String codec) {
+        synchronized (lock) {
+            if ("vp9".equals(codec)) {
+                mime = MIME_VP9;
+                codecId = 5;
+            } else {
+                mime = MIME_H264;
+                codecId = 1;
+            }
+        }
     }
 
     void attach(Surface surface) {
@@ -46,7 +64,7 @@ final class H264Decoder {
         synchronized (lock) {
             this.surface = surface;
             running = true;
-            worker = new Thread(this::decodeLoop, "rc-h264");
+            worker = new Thread(this::decodeLoop, "rc-video");
             worker.setDaemon(true);
             worker.start();
         }
@@ -72,7 +90,7 @@ final class H264Decoder {
     }
 
     void offer(byte[] payload) {
-        if (payload.length < 32 || Protocol.u8(payload, 24) != 1) return;
+        if (payload.length < 32 || Protocol.u8(payload, 24) != codecId) return;
         int width = Protocol.u16(payload, 20);
         int height = Protocol.u16(payload, 22);
         int dataLength = Protocol.i32(payload, 28);
@@ -90,6 +108,7 @@ final class H264Decoder {
 
     private void decodeLoop() {
         MediaCodec codec = null;
+        String codecMime = null;
         int codecWidth = 0;
         int codecHeight = 0;
         boolean hasKeyframe = false;
@@ -100,18 +119,22 @@ final class H264Decoder {
             while (true) {
                 Frame frame;
                 Surface target;
+                String targetMime;
                 synchronized (lock) {
                     while (running && pending == null) lock.wait();
                     if (!running) break;
                     frame = pending;
                     pending = null;
                     target = surface;
+                    targetMime = mime;
                 }
                 if (target == null) continue;
 
-                if (codec == null || codecWidth != frame.width || codecHeight != frame.height) {
+                if (codec == null || codecWidth != frame.width || codecHeight != frame.height
+                        || !targetMime.equals(codecMime)) {
                     if (codec != null) releaseCodec(codec);
-                    codec = createCodec(target, frame.width, frame.height);
+                    codec = createCodec(target, frame.width, frame.height, targetMime);
+                    codecMime = targetMime;
                     codecWidth = frame.width;
                     codecHeight = frame.height;
                     hasKeyframe = false;
@@ -152,7 +175,8 @@ final class H264Decoder {
             Thread.currentThread().interrupt();
         } catch (Exception e) {
             if (running) {
-                listener.onDecoderError("H.264 解码失败：" + e.getClass().getSimpleName()
+                listener.onDecoderError(videoLabel() + " 解码失败："
+                        + e.getClass().getSimpleName()
                         + (e.getMessage() == null ? "" : " " + e.getMessage()));
             }
         } finally {
@@ -165,10 +189,16 @@ final class H264Decoder {
         }
     }
 
-    private static MediaCodec createCodec(Surface surface, int width, int height) throws IOException {
-        MediaCodec codec = MediaCodec.createDecoderByType("video/avc");
+    private String videoLabel() {
+        return MIME_VP9.equals(mime) ? "VP9" : "H.264";
+    }
+
+    private static MediaCodec createCodec(Surface surface, int width, int height, String mime)
+            throws IOException {
+        MediaCodec codec = MediaCodec.createDecoderByType(mime);
         try {
-            MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
+            // VP9 帧自带分辨率，无需 CSD；H.264 的 SPS/PPS 随首个关键帧给出。
+            MediaFormat format = MediaFormat.createVideoFormat(mime, width, height);
             codec.configure(format, surface, null, 0);
             codec.start();
             return codec;

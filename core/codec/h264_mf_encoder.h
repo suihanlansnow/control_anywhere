@@ -39,6 +39,7 @@ class H264MfEncoder final : public IVideoEncoder {
   int target_bitrate_kbps() const override { return static_cast<int>(bitrate_ / 1000); }
   void* native_device_manager() override { return device_manager_.Get(); }
   const char* name() const override { return hardware_ ? "h264-mf-hw" : "h264-mf-sw"; }
+  bool is_hardware() const override { return hardware_; }
 
  private:
   bool activate(bool hardware_only, std::string* error);

@@ -13,6 +13,11 @@
 #include "codec/ffmpeg_h264_decoder.h"
 #endif
 
+#if defined(RC_HAVE_FFMPEG) && RC_HAVE_FFMPEG
+#include "codec/ffmpeg_vp9_decoder.h"
+#include "codec/ffmpeg_vp9_encoder.h"
+#endif
+
 namespace rc {
 
 std::unique_ptr<IVideoEncoder> create_encoder(const std::string& kind,
@@ -35,18 +40,37 @@ std::unique_ptr<IVideoEncoder> create_encoder(const std::string& kind,
   }
 #endif
 
+#if defined(RC_HAVE_FFMPEG) && RC_HAVE_FFMPEG
+  if (kind == "vp9") {
+    return std::make_unique<FFmpegVp9Encoder>();
+  }
+#endif
+
   if (error) *error = "encoder not supported: " + kind;
   return nullptr;
 }
 
-std::unique_ptr<IVideoDecoder> create_decoder(std::string* error) {
+std::unique_ptr<IVideoDecoder> create_decoder(const std::string& codec,
+                                              std::string* error) {
+  if (codec == "h264") {
 #ifdef _WIN32
-  return std::make_unique<H264Decoder>();
+    return std::make_unique<H264Decoder>();
 #endif
 #ifdef __linux__
-  return std::make_unique<H264Decoder>();
+    return std::make_unique<H264Decoder>();
 #endif
-  if (error) *error = "decoder not supported on this platform";
+  }
+
+  if (codec == "vp9") {
+#if defined(RC_HAVE_FFMPEG) && RC_HAVE_FFMPEG
+    return std::make_unique<FFmpegVp9Decoder>();
+#else
+    if (error) *error = "vp9 decoder not built in this package";
+    return nullptr;
+#endif
+  }
+
+  if (error) *error = "decoder not supported: " + codec;
   return nullptr;
 }
 
@@ -56,6 +80,7 @@ const char* codec_name(VideoCodec codec) {
     case VideoCodec::H265: return "h265";
     case VideoCodec::AV1: return "av1";
     case VideoCodec::Jpeg: return "jpeg";
+    case VideoCodec::Vp9: return "vp9";
   }
   return "unknown";
 }

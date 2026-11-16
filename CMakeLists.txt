@@ -27,6 +27,7 @@ set(RC_CORE_SOURCES
   core/session/runner.cpp
   core/capture/capture_factory.cpp
   core/codec/codec_factory.cpp
+  core/codec/codec_registry.cpp
   core/transfer/file_transfer.cpp
 )
 
@@ -61,6 +62,8 @@ if(UNIX AND NOT APPLE)
     core/codec/ffmpeg_jpeg_encoder.cpp
     core/codec/ffmpeg_h264_encoder.cpp
     core/codec/ffmpeg_h264_decoder.cpp
+    core/codec/ffmpeg_vp9_encoder.cpp
+    core/codec/ffmpeg_vp9_decoder.cpp
     core/render/sdl_renderer.cpp
   )
 
@@ -87,6 +90,31 @@ target_include_directories(rc_core PUBLIC
 if(WIN32)
   target_link_libraries(rc_core PUBLIC
     ws2_32 d3d11 dxgi ole32 windowscodecs mfplat mfuuid mf user32)
+
+  # VP9 没有系统级软件编码器：Windows 通过随包分发的 FFmpeg 提供 libvpx-vp9。
+  # 没有该目录时 VP9 在本端不可用（协商会明确拒绝），H.264 链路不受影响。
+  option(RC_ENABLE_FFMPEG_VP9 "Enable VP9 codec via bundled FFmpeg (Windows)" ON)
+  if(RC_ENABLE_FFMPEG_VP9)
+    set(RC_FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg-win64-lgpl"
+        CACHE PATH "FFmpeg shared dev package root (BtbN LGPL build)")
+    if(EXISTS "${RC_FFMPEG_ROOT}/include/libavcodec/avcodec.h" AND
+       EXISTS "${RC_FFMPEG_ROOT}/lib/avcodec.lib")
+      target_sources(rc_core PRIVATE
+        core/codec/ffmpeg_vp9_encoder.cpp
+        core/codec/ffmpeg_vp9_decoder.cpp
+      )
+      target_include_directories(rc_core PUBLIC "${RC_FFMPEG_ROOT}/include")
+      target_link_libraries(rc_core PUBLIC
+        "${RC_FFMPEG_ROOT}/lib/avcodec.lib"
+        "${RC_FFMPEG_ROOT}/lib/avutil.lib"
+        "${RC_FFMPEG_ROOT}/lib/swscale.lib")
+      target_compile_definitions(rc_core PUBLIC RC_HAVE_FFMPEG=1)
+      file(GLOB RC_FFMPEG_DLLS "${RC_FFMPEG_ROOT}/bin/*.dll")
+      message(STATUS "VP9 enabled via ${RC_FFMPEG_ROOT}")
+    else()
+      message(STATUS "FFmpeg not found at ${RC_FFMPEG_ROOT}: VP9 disabled on Windows")
+    endif()
+  endif()
 endif()
 
 if(UNIX AND NOT APPLE)
@@ -109,6 +137,7 @@ if(UNIX AND NOT APPLE)
     ${SDL2_LIBRARIES}
     dl pthread
   )
+  target_compile_definitions(rc_core PUBLIC RC_HAVE_FFMPEG=1)
   target_link_directories(rc_core PUBLIC
     ${X11_LIBRARY_DIRS}
     ${XEXT_LIBRARY_DIRS}
@@ -269,5 +298,16 @@ if(RC_ENABLE_WEBRTC_POC)
   if(WIN32)
     target_link_libraries(rc-webrtc-poc PRIVATE ws2_32 secur32 crypt32)
   endif()
+endif()
+
+# Windows：VP9 依赖的 FFmpeg 以 DLL 形式分发，构建后随可执行文件一起落盘。
+if(WIN32 AND RC_FFMPEG_DLLS)
+  foreach(rc_target rc-cli rc-web rc-app rc-webrtc-poc)
+    if(TARGET ${rc_target})
+      add_custom_command(TARGET ${rc_target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${RC_FFMPEG_DLLS} "$<TARGET_FILE_DIR:${rc_target}>")
+    endif()
+  endforeach()
 endif()
 

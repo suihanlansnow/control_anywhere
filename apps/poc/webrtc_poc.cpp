@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 #endif
     std::string decoder_error;
-    auto decoder = rc::create_decoder(&decoder_error);
+    auto decoder = rc::create_decoder("h264", &decoder_error);
     if (!decoder || !decoder->open(&decoder_error)) {
       std::printf("[poc] decoder open failed: %s\n", decoder_error.c_str());
       return;

@@ -31,12 +31,16 @@ class IVideoDecoder {
   virtual void close() = 0;
   virtual const char* name() const = 0;
 
-  // 输入一帧 Annex-B 码流；只有真正解出一幅画面时才返回 true。
+  // 输入一帧完整编码帧（H.264 为 Annex-B，VP9 为原始压缩帧）；
+  // 只有真正解出一幅画面时才返回 true。
   virtual bool decode(const uint8_t* data, std::size_t len, int64_t timestamp_us,
                       DecodedImage& out, std::string* error) = 0;
+  // 实际使用的后端是否为硬件解码（用于能力上报与前端展示）。
+  virtual bool is_hardware() const { return false; }
 };
 
-// 按平台创建 H.264 解码器（Windows: Media Foundation MFT；Linux: FFmpeg）。
-std::unique_ptr<IVideoDecoder> create_decoder(std::string* error);
+// 按协商出的 codec（"h264" / "vp9"）创建解码器。
+std::unique_ptr<IVideoDecoder> create_decoder(const std::string& codec,
+                                              std::string* error);
 
 }  // namespace rc

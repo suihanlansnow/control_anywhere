@@ -827,12 +827,18 @@ QWidget* MainWindow::buildDisplayPanel() {
   auto* card2 = makeCard(tr("编码"));
   {
     auto* vbox = static_cast<QVBoxLayout*>(card2->layout());
-    // 编码固定为 H.264：服务端只提供 H.264 编码器，客户端也只内置 H.264 解码器。
     auto* lblCodec = new QLabel(tr("视频编码"));
     lblCodec->setObjectName("FieldLabel");
-    auto* codecValue = new QLabel(tr("H.264（硬件加速，自动回退软件编码）"));
+    comboCodec_ = new QComboBox();
+    comboCodec_->addItem(tr("自动（优先 VP9）"), QStringLiteral("auto"));
+    comboCodec_->addItem(tr("VP9（硬件优先，自动回退软件）"), QStringLiteral("vp9"));
+    comboCodec_->addItem(tr("H.264（兼容旧设备）"), QStringLiteral("h264"));
+    comboCodec_->setCurrentIndex(0);
+    auto* codecHint = new QLabel(tr("修改后在下一次连接时生效；强制选择不可用时会明确报错"));
+    codecHint->setObjectName("FieldHint");
     vbox->addWidget(lblCodec);
-    vbox->addWidget(codecValue);
+    vbox->addWidget(comboCodec_);
+    vbox->addWidget(codecHint);
 
     vbox->addSpacing(8);
     switchAutoBitrate_ = new QCheckBox(tr("自适应码率"));
@@ -1159,7 +1165,7 @@ QWidget* MainWindow::buildAboutPanel() {
     };
     vbox->addWidget(makeInfoRow(tr("版本"), mkVal("0.1.0")));
     vbox->addWidget(makeInfoRow(tr("协议"), mkVal("rc-frame v1")));
-    vbox->addWidget(makeInfoRow(tr("编码器"), mkVal("H.264")));
+    vbox->addWidget(makeInfoRow(tr("编码器"), mkVal(tr("VP9 / H.264（可配置）"))));
     vbox->addWidget(makeInfoRow(tr("平台"), mkVal(kPlatformName)));
     vbox->addWidget(makeInfoRow(tr("构建类型"), mkVal("Release")));
   }
@@ -1236,7 +1242,7 @@ void MainWindow::onStartHost() {
                       : kPlatformFallbackHostId;
   cfg.alias = kPlatformName;
   cfg.password = editPassword_ ? editPassword_->text().toStdString() : "";
-  cfg.codec = "h264";
+  cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "auto";
   cfg.capture = kPlatformCapture;
   cfg.fps = 30;
   cfg.max_frames = 0;
@@ -1299,7 +1305,7 @@ void MainWindow::onStartClient() {
   cfg.device_id = kPlatformClientId;
   cfg.target_id = target.toStdString();
   cfg.password = password.toStdString();
-  cfg.codec = "h264";
+  cfg.codec = comboCodec_ ? comboCodec_->currentData().toString().toStdString() : "auto";
   cfg.render = false;
   cfg.connect_timeout_ms = sliderTimeout_ ? sliderTimeout_->value() * 1000 : 5000;
   cfg.tcp_no_delay = switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true;
@@ -1539,6 +1545,8 @@ void MainWindow::saveSettings() {
   s.setValue("client/target", editTargetId_ ? editTargetId_->text() : "");
   s.setValue("client/password", editConnectPassword_ ? editConnectPassword_->text() : "");
   s.setValue("display/auto_bitrate", switchAutoBitrate_ ? switchAutoBitrate_->isChecked() : false);
+  s.setValue("display/codec",
+             comboCodec_ ? comboCodec_->currentData().toString() : QStringLiteral("auto"));
   s.setValue("network/timeout", sliderTimeout_ ? sliderTimeout_->value() : 30);
   s.setValue("network/auto_reconnect", switchAutoReconnect_ ? switchAutoReconnect_->isChecked() : true);
   s.setValue("network/tcp_no_delay", switchTcpNoDelay_ ? switchTcpNoDelay_->isChecked() : true);
@@ -1570,6 +1578,11 @@ void MainWindow::loadSettings() {
     editConnectPassword_->setText(s.value("client/password", "").toString());
   }
   if (switchAutoBitrate_) switchAutoBitrate_->setChecked(s.value("display/auto_bitrate", false).toBool());
+  if (comboCodec_) {
+    const int index =
+        comboCodec_->findData(s.value("display/codec", "auto").toString());
+    comboCodec_->setCurrentIndex(index >= 0 ? index : 0);
+  }
   if (sliderTimeout_) sliderTimeout_->setValue(s.value("network/timeout", 30).toInt());
   if (switchAutoReconnect_) switchAutoReconnect_->setChecked(s.value("network/auto_reconnect", true).toBool());
   if (switchTcpNoDelay_) switchTcpNoDelay_->setChecked(s.value("network/tcp_no_delay", true).toBool());
