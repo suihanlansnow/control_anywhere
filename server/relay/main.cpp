@@ -1,5 +1,7 @@
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -9,9 +11,19 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 #include "base/json.h"
 #include "base/log.h"
@@ -51,6 +63,15 @@ std::mutex g_mutex;
 std::map<std::string, std::shared_ptr<Peer>> g_devices;
 std::map<uint64_t, Session> g_sessions;
 std::map<uint64_t, PendingSession> g_pending;
+
+// 优雅退出相关：信号/控制台回调会设置 g_running 并关闭监听套接字以唤醒 accept。
+std::atomic<bool> g_running{true};
+std::mutex g_shutdown_mutex;
+std::condition_variable g_shutdown_cv;
+TcpListener* g_listener = nullptr;
+// 当前活跃连接，用于退出时统一关闭、让各处理线程自行收尾。
+std::mutex g_conn_mutex;
+std::set<std::shared_ptr<Connection>> g_connections;
 std::atomic<uint64_t> g_next_session{1000};
 // 启动参数指定，之后只读；随 RegisterAck 下发给被控端和主控端。
 std::vector<std::string> g_ice_servers;
@@ -68,6 +89,60 @@ constexpr uint64_t kDefaultPendingTtlMs = 60000;
 uint64_t g_pending_ttl_ms = kDefaultPendingTtlMs;
 
 json::Value object() { return json::Value::make_object(); }
+
+// 触发优雅退出：置位标志并关闭监听套接字，使阻塞的 accept() 返回。
+void shutdown_relay() {
+  g_running.store(false);
+  g_shutdown_cv.notify_all();
+  if (g_listener) g_listener->close();
+}
+
+#ifdef _WIN32
+BOOL WINAPI console_ctrl_handler(DWORD type) {
+  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
+      type == CTRL_CLOSE_EVENT || type == CTRL_SHUTDOWN_EVENT) {
+    shutdown_relay();
+    return TRUE;
+  }
+  return FALSE;
+}
+#else
+void signal_handler(int) { shutdown_relay(); }
+#endif
+
+void install_signal_handlers() {
+#ifdef _WIN32
+  SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+#else
+  std::signal(SIGINT, signal_handler);
+  std::signal(SIGTERM, signal_handler);
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
+}
+
+// 脱离当前会话在后台运行。Windows 下仅 FreeConsole；如需 SCM 服务请用 nssm 等包装。
+bool daemonize() {
+#ifdef _WIN32
+  FreeConsole();
+  return true;
+#else
+  pid_t pid = fork();
+  if (pid < 0) return false;
+  if (pid > 0) std::_Exit(0);
+  if (setsid() < 0) return false;
+  pid = fork();
+  if (pid < 0) return false;
+  if (pid > 0) std::_Exit(0);
+  int fd = ::open("/dev/null", O_RDWR);
+  if (fd >= 0) {
+    ::dup2(fd, STDIN_FILENO);
+    ::dup2(fd, STDOUT_FILENO);
+    ::dup2(fd, STDERR_FILENO);
+    if (fd > 2) ::close(fd);
+  }
+  return true;
+#endif
+}
 
 uint64_t monotonic_ms() {
   return static_cast<uint64_t>(
@@ -493,6 +568,11 @@ void forward_session_frame(const std::shared_ptr<Peer>& peer, const DecodedFrame
 }
 
 void cleanup(const std::shared_ptr<Peer>& peer) {
+  // 从活跃连接表移除，退出阶段用于判断是否还有连接在收尾。
+  if (peer->conn) {
+    std::lock_guard<std::mutex> lock(g_conn_mutex);
+    g_connections.erase(peer->conn);
+  }
   struct Notify {
     std::shared_ptr<Connection> conn;
     uint64_t session_id;
@@ -591,7 +671,9 @@ void handle_client(std::shared_ptr<Connection> conn) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  install_signal_handlers();
   uint16_t port = kDefaultControlPort;
+  bool want_daemon = false;
   auto with_scheme = [](const std::string& value, const std::string& scheme) {
     if (value.rfind("stun:", 0) == 0 || value.rfind("turn:", 0) == 0 ||
         value.rfind("turns:", 0) == 0) {
@@ -621,13 +703,16 @@ int main(int argc, char** argv) {
       g_pending_ttl_ms = static_cast<uint64_t>(seconds < 5 ? 5 : seconds) * 1000;
     } else if (arg == "--no-device-db") {
       g_device_db_path.clear();
+    } else if (arg == "--daemon") {
+      want_daemon = true;
     } else {
       std::fprintf(stderr,
                    "usage: %s [--port N] [--stun host:port] "
                    "[--turn [user:pass@]host:port]\n"
                    "       [--tls-cert relay.pem --tls-key relay-key.pem]\n"
                    "       [--device-db relay-devices.json | --no-device-db]\n"
-                   "       [--advertise-host <对外地址>] [--session-ttl 60]\n",
+                   "       [--advertise-host <对外地址>] [--session-ttl 60]\n"
+                   "       [--daemon]\n",
                    argv[0]);
       return 2;
     }
@@ -638,6 +723,11 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  if (want_daemon && !daemonize()) {
+    std::fprintf(stderr, "daemonize 失败\n");
+    return 1;
+  }
+
   load_device_db();
 
   std::string error;
@@ -646,19 +736,28 @@ int main(int argc, char** argv) {
     RC_LOGE("relay", error);
     return 1;
   }
+  g_listener = &listener;
 
   RC_LOGI("relay", "listening on tcp/" << port
                                    << (g_tls_cert.empty() ? " (plaintext)" : " (TLS)"));
-  // 邀请超时清理线程：每 5 秒扫描一次待响应的会话。
-  std::thread([] {
-    while (true) {
-      std::this_thread::sleep_for(std::chrono::seconds(5));
+  // 邀请超时清理线程：每 5 秒扫描一次待响应的会话；退出时用条件变量立即唤醒。
+  std::thread sweeper([] {
+    std::unique_lock<std::mutex> lock(g_shutdown_mutex);
+    while (g_running.load()) {
+      g_shutdown_cv.wait_for(lock, std::chrono::seconds(5),
+                             [] { return !g_running.load(); });
+      if (!g_running.load()) break;
+      lock.unlock();
       sweep_pending_sessions();
+      lock.lock();
     }
-  }).detach();
-  while (true) {
+  });
+  while (g_running.load()) {
     TcpSocket socket = listener.accept();
-    if (!socket.valid()) continue;
+    if (!socket.valid()) {
+      if (!g_running.load()) break;
+      continue;
+    }
     std::thread([sock = std::move(socket)]() mutable {
       if (!g_tls_cert.empty()) {
         std::string error;
@@ -668,7 +767,29 @@ int main(int argc, char** argv) {
         }
       }
       auto conn = std::make_shared<Connection>(std::move(sock));
+      {
+        std::lock_guard<std::mutex> lock(g_conn_mutex);
+        g_connections.insert(conn);
+      }
       handle_client(conn);
     }).detach();
   }
+
+  // 优雅退出：通知所有连接线程收尾，等待清理线程退出后再返回。
+  RC_LOGI("relay", "shutting down, closing " << [&] {
+    std::lock_guard<std::mutex> lock(g_conn_mutex);
+    return g_connections.size();
+  }() << " connection(s)");
+  {
+    std::lock_guard<std::mutex> lock(g_conn_mutex);
+    for (const auto& conn : g_connections) conn->close();
+  }
+  g_running.store(false);
+  if (sweeper.joinable()) sweeper.join();
+  // 给连接线程一点时间完成 cleanup（移除自身、通知对端会话关闭）。
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  save_device_db(&error);
+  listener.close();
+  RC_LOGI("relay", "bye");
+  return 0;
 }

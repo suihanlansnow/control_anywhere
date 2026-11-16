@@ -83,7 +83,13 @@ rc-relay --port 21116 --advertise-host 203.0.113.10
 
 # 邀请等待被控端响应的超时（秒，默认 60），超时会清理并向主控端回 session_expired
 rc-relay --port 21116 --session-ttl 60
+
+# 后台运行（Linux 双 fork 脱离终端；Windows 仅释放控制台，SCM 服务建议用 nssm 包装）
+rc-relay --port 21116 --daemon
 ```
+
+> 中继支持优雅退出：收到 `SIGINT`/`SIGTERM`（Linux）或 `Ctrl+C`/控制台关闭（Windows）时，
+> 停止接收新连接、关闭所有现有连接、保存设备身份库后退出（退出码 0）。
 
 启用 TLS 后，被控端与主控端都要加 `--tls`，并用以下三种方式之一校验证书：
 
@@ -207,6 +213,7 @@ rc-cli connect win-host --password 123456 --relay 127.0.0.1:21116
 - **HMAC-SHA256 鉴权**：中继下发挑战，被控端用密码生成 proof，主控端回传验证。
 - **鉴权保护**：密码失败按主控设备号指数退避锁定，并有 60 秒全局失败窗口；被控端可要求本机弹窗确认连接。
 - **邀请超时清理**：待被控端确认的会话默认 60 秒过期（`--session-ttl` 可调），自动清理并通知主控端。
+- **优雅退出与守护**：信号/控制台事件触发后停止监听、关闭连接、落盘设备库再退出；`--daemon` 后台运行。
 - **设备身份与防顶号**：被控端用本地 EC P-256 私钥响应中继挑战，中继按设备号固定公钥并持久化，异键注册被拒。
 - **可选 TLS**：中继与两端之间支持 mbed TLS 加密，可用 CA、证书指纹或显式不安全模式校验。
 - **跨平台采集**：Windows DXGI；Linux X11 或 PipeWire（xdg-desktop-portal）。
